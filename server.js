@@ -212,10 +212,22 @@ const PAGE_VIEWER = `<!DOCTYPE html>
   <div class="foot">
     <button class="chip on" id="follow">⌖ Suivre</button>
     <button class="chip" id="fit">Voir la trace</button>
+    <button class="chip" id="meteo">🌬 Météo</button>
     <span class="msg mono" id="pos">—</span>
   </div>
 </div>
 
+<div id="windyOverlay" style="position:fixed;inset:0;z-index:2000;background:var(--navy);display:none;flex-direction:column">
+  <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;padding:calc(env(safe-area-inset-top) + 8px) 12px 8px">
+    <span style="font-weight:700">Météo (ECMWF, nœuds)</span>
+    <select id="wLayer" class="chip"></select>
+    <a id="windyFull" class="chip" style="margin-left:auto;text-decoration:none" href="#">⤢</a>
+    <button id="windyClose" class="chip">✕</button>
+  </div>
+  <iframe id="windyFrame" title="Windy" style="flex:1;border:0;width:100%"></iframe>
+</div>
+
+<script src="/windy.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.js"></script>
 <script>
 "use strict";
@@ -308,6 +320,25 @@ function addPoint(p,animate){
 document.getElementById('follow').onclick=function(){follow=!follow;this.classList.toggle('on',follow);};
 document.getElementById('fit').onclick=function(){
   if(pts.length){map.fitBounds(L.latLngBounds(pts.map(function(x){return[x[0],x[1]];})).pad(0.15));follow=false;document.getElementById('follow').classList.remove('on');}
+};
+
+var wLayer=document.getElementById('wLayer');
+windyFillLayers(wLayer,'wind');
+var wCenter=null;
+function renderWindy(){ if(!wCenter)return;
+  document.getElementById('windyFrame').src=windyUrl(wCenter.lat,wCenter.lon,wLayer.value,true); }
+wLayer.onchange=renderWindy;
+document.getElementById('meteo').onclick=function(){
+  var last=pts.length?pts[pts.length-1]:null,lat,lon;
+  if(last){lat=last[0];lon=last[1];}else{var c=map.getCenter();lat=c.lat;lon=c.lng;}
+  wCenter={lat:(+lat).toFixed(3),lon:(+lon).toFixed(3)};
+  renderWindy();
+  document.getElementById('windyFull').href='/meteo?id='+encodeURIComponent(id);
+  document.getElementById('windyOverlay').style.display='flex';
+};
+document.getElementById('windyClose').onclick=function(){
+  document.getElementById('windyOverlay').style.display='none';
+  document.getElementById('windyFrame').src='about:blank';
 };
 
 function fail(m){document.getElementById('waitMsg').textContent=m;}
@@ -531,6 +562,114 @@ if(queue.length)flush();
 </body>
 </html>
 `;
+const PAGE_METEO = `<!DOCTYPE html>
+<html lang="fr">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, viewport-fit=cover">
+<title>Météo</title>
+<style>
+  :root{--navy:#0a1a26;--navy2:#0e2636;--line:#1d3a4d;--amber:#f5a623;--amber2:#ffc25a;--cyan:#39c0d3;--ink:#e8f1f6;--dim:#8fb0c2}
+  *{box-sizing:border-box;-webkit-tap-highlight-color:transparent}
+  html,body{height:100%;margin:0;background:var(--navy);color:var(--ink);
+    font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;display:flex;flex-direction:column}
+  .bar{display:flex;align-items:center;gap:8px;flex-wrap:wrap;padding:calc(env(safe-area-inset-top) + 8px) 12px 8px}
+  .back{color:var(--cyan);text-decoration:none;font-weight:600;font-size:13px;white-space:nowrap}
+  .name{font-weight:700;font-size:15px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:40vw}
+  .age{font-size:11px;color:var(--dim);white-space:nowrap}
+  .chip{background:var(--navy2);color:var(--ink);border:1px solid var(--line);border-radius:8px;
+    padding:7px 10px;font-size:12px;font-weight:600;cursor:pointer}
+  .grow{margin-left:auto}
+  iframe{flex:1;border:0;width:100%}
+  .msg{position:absolute;top:52%;left:0;right:0;text-align:center;color:var(--dim);font-size:13px;padding:0 24px}
+</style>
+</head>
+<body>
+<div class="bar">
+  <a class="back" id="back" href="#">← Suivi</a>
+  <span class="name" id="name">Météo</span>
+  <span class="age" id="age"></span>
+  <select id="layer" class="chip grow"></select>
+  <button class="chip" id="recenter">⌖ Bateau</button>
+</div>
+<iframe id="frame" title="Windy"></iframe>
+<div class="msg" id="msg">Chargement…</div>
+
+<script src="/windy.js"></script>
+<script>
+"use strict";
+var id=new URL(location.href).searchParams.get('id');
+document.getElementById('back').href='/v?id='+encodeURIComponent(id||'');
+var layer=document.getElementById('layer');
+windyFillLayers(layer,'wind');
+var center=null, hasPos=false;
+function ageTxt(t){var s=Math.round((Date.now()-t)/1000);
+  return s<60?('il y a '+s+' s'):s<3600?('il y a '+Math.round(s/60)+' min'):('il y a '+Math.floor(s/3600)+' h');}
+function render(){ if(!center)return;
+  document.getElementById('frame').src=windyUrl(center.lat,center.lon,layer.value,hasPos); }
+layer.onchange=render;
+function load(){
+  var msg=document.getElementById('msg');
+  if(!id){msg.textContent='Lien invalide.';return;}
+  fetch('/api/tracks/'+id).then(function(r){if(!r.ok)throw 0;return r.json();}).then(function(d){
+    document.getElementById('name').textContent=d.name||'Météo';
+    document.title='Météo — '+(d.name||'');
+    if(d.last){
+      msg.style.display='none';hasPos=true;
+      document.getElementById('age').textContent='position '+ageTxt(d.last[2]);
+      center={lat:d.last[0].toFixed(3),lon:d.last[1].toFixed(3)};
+    }else{
+      msg.textContent='En attente de la première position — météo centrée sur le golfe de Gascogne.';
+      hasPos=false;center={lat:'47.5',lon:'-5.0'};
+    }
+    render();
+  }).catch(function(){msg.textContent='Suivi introuvable.';});
+}
+document.getElementById('recenter').onclick=load;
+load();
+</script>
+</body>
+</html>
+`;
+const PAGE_WINDYJS = `"use strict";
+/* Source unique pour l'intégration Windy (embed gratuit).
+ * Le modèle reste ECMWF (l'embed ignore le paramètre de modèle) ;
+ * seul le calque (overlay) est réellement sélectionnable. */
+var WINDY_LAYERS = [
+  { v: 'wind', t: 'Vent' },
+  { v: 'gust', t: 'Rafales' },
+  { v: 'waves', t: 'Vagues' },
+  { v: 'swell1', t: 'Houle' },
+  { v: 'pressure', t: 'Pression' },
+  { v: 'clouds', t: 'Nuages' },
+  { v: 'rain', t: 'Pluie' },
+  { v: 'temp', t: 'Température' },
+  { v: 'currents', t: 'Courants' },
+  { v: 'satellite', t: 'Satellite' },
+  { v: 'radar', t: 'Radar' }
+];
+function windyProduct(overlay) {
+  return (overlay === 'waves' || overlay === 'swell1') ? 'ecmwfWaves' : 'ecmwf';
+}
+function windyUrl(lat, lon, overlay, marker) {
+  overlay = overlay || 'wind';
+  var p = new URLSearchParams({
+    lat: lat, lon: lon, detailLat: lat, detailLon: lon, zoom: '7', level: 'surface',
+    overlay: overlay, product: windyProduct(overlay), menu: '', message: 'true',
+    marker: marker ? 'true' : '', calendar: 'now', pressure: '', type: 'map',
+    location: 'coordinates', detail: 'true', metricWind: 'kt', metricTemp: '°C', radarRange: '-1'
+  });
+  return 'https://embed.windy.com/embed2.html?' + p.toString();
+}
+function windyFillLayers(sel, def) {
+  WINDY_LAYERS.forEach(function (o) {
+    var e = document.createElement('option');
+    e.value = o.v; e.textContent = o.t;
+    if (o.v === (def || 'wind')) e.selected = true;
+    sel.appendChild(e);
+  });
+}
+`;
 
 const server = http.createServer(async (req, res) => {
   const u = new URL(req.url, 'http://x');
@@ -585,9 +724,11 @@ const server = http.createServer(async (req, res) => {
     }
   } catch (e) { return json(res, 500, { error: 'stockage indisponible' }); }
 
+  if (p === '/windy.js') { res.writeHead(200, { 'Content-Type': 'text/javascript; charset=utf-8' }); return res.end(PAGE_WINDYJS); }
   if (p === '/') return serveHTML(res, PAGE_INDEX);
   if (p === '/v') return serveHTML(res, PAGE_VIEWER);
   if (p === '/p') return serveHTML(res, PAGE_PUBLISHER);
+  if (p === '/meteo') return serveHTML(res, PAGE_METEO);
   res.writeHead(404, { 'Content-Type': 'text/plain' }); res.end('404');
 });
 
