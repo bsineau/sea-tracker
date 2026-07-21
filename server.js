@@ -719,6 +719,20 @@ const PAGE_PUBLISHER = `<!DOCTYPE html>
     </div>
     <p class="warn">Ce lien ne contient <b>pas</b> ta clé de publication : les suiveurs voient la trace, ils ne peuvent pas émettre.</p>
   </div>
+
+  <div class="card">
+    <div class="k">Émettre sans garder la page ouverte (app Traccar Client)</div>
+    <p class="warn" style="margin-top:2px">Installe <b>Traccar Client</b> (gratuit, App Store). Elle émet en arrière‑plan, écran éteint. Renseigne :</p>
+    <div class="k" style="margin-top:6px">URL du serveur</div>
+    <div class="link" id="traccarUrl">—</div>
+    <div class="k" style="margin-top:6px">Identifiant de l’appareil</div>
+    <div class="link" id="traccarId">—</div>
+    <div class="row">
+      <button class="mini" id="copyTUrl">Copier l’URL</button>
+      <button class="mini" id="copyTId">Copier l’identifiant</button>
+    </div>
+    <p class="warn">Dans Traccar Client : active le service, choisis un intervalle. Hors couverture réseau (grand large), aucune app cellulaire n’émet — il faut un traceur satellite.</p>
+  </div>
 </div>
 <div class="toast" id="toast"></div>
 
@@ -728,6 +742,9 @@ var q=new URL(location.href).searchParams;
 var id=q.get('id'), key=q.get('key');
 var viewerUrl=location.origin+'/v?id='+id;
 document.getElementById('viewerLink').textContent=viewerUrl;
+var traccarUrl=location.origin+'/api/osmand';
+document.getElementById('traccarUrl').textContent=traccarUrl;
+document.getElementById('traccarId').textContent=key||'—';
 
 var D2R=Math.PI/180,R2D=180/Math.PI,R=6371000;
 function bearing(a,b){var p1=a.lat*D2R,p2=b.lat*D2R,dl=(b.lon-a.lon)*D2R;
@@ -823,6 +840,14 @@ document.getElementById('copyView').onclick=function(){
   else toast('Copie manuelle');
 };
 document.getElementById('openView').onclick=function(){window.open(viewerUrl,'_blank');};
+document.getElementById('copyTUrl').onclick=function(){
+  if(navigator.clipboard)navigator.clipboard.writeText(traccarUrl).then(function(){toast('URL copiée');});
+  else toast('Copie manuelle');
+};
+document.getElementById('copyTId').onclick=function(){
+  if(navigator.clipboard)navigator.clipboard.writeText(key||'').then(function(){toast('Identifiant copié');});
+  else toast('Copie manuelle');
+};
 
 refresh();
 if(queue.length)flush();
