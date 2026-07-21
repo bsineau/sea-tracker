@@ -24,6 +24,39 @@ const sha = (s) => crypto.createHash('sha256').update(String(s)).digest('hex');
 const num = (v) => (typeof v === 'number' && isFinite(v)) ? v : null;
 const r6 = (v) => Math.round(v * 1e6) / 1e6;
 
+// --- Export traces (GPX / CSV) ---
+function isoT(ms){ try { return new Date(ms).toISOString().replace(/\.\d+Z$/, 'Z'); } catch { return ''; } }
+function xmlEsc(s){ return String(s == null ? '' : s).replace(/[&<>"]/g, function(c){ return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]; }); }
+function tracksToGPX(tracks){
+  let out = '<?xml version="1.0" encoding="UTF-8"?>\n<gpx version="1.1" creator="Sea Tracker" xmlns="http://www.topografix.com/GPX/1/1">\n';
+  for (const t of tracks){
+    out += '<trk><name>' + xmlEsc(t.name) + '</name><trkseg>\n';
+    for (const p of t.points){
+      out += '<trkpt lat="' + p[0] + '" lon="' + p[1] + '"><time>' + isoT(p[2]) + '</time>';
+      if (p[4] != null) out += '<course>' + p[4] + '</course>';
+      if (p[3] != null) out += '<speed>' + (Math.round(p[3] * 0.514444 * 1000) / 1000) + '</speed>';
+      out += '</trkpt>\n';
+    }
+    out += '</trkseg></trk>\n';
+  }
+  return out + '</gpx>\n';
+}
+function tracksToCSV(tracks, withBoat){
+  let out = (withBoat ? 'boat,' : '') + 'time,lat,lon,sog_kt,cog_deg\n';
+  for (const t of tracks){
+    const nm = '"' + String(t.name || '').replace(/"/g, '""') + '"';
+    for (const p of t.points){
+      out += (withBoat ? nm + ',' : '') + isoT(p[2]) + ',' + p[0] + ',' + p[1] + ',' + (p[3] == null ? '' : p[3]) + ',' + (p[4] == null ? '' : p[4]) + '\n';
+    }
+  }
+  return out;
+}
+function fnameSafe(s){ return (String(s || 'trace').replace(/[^a-zA-Z0-9_-]+/g, '_').slice(0, 40)) || 'trace'; }
+function sendFile(res, body, type, filename){
+  res.writeHead(200, Object.assign({ 'Content-Type': type + '; charset=utf-8', 'Content-Disposition': 'attachment; filename="' + filename + '"' }, CORS));
+  res.end(body);
+}
+
 // --- Vent animé : grille Open-Meteo -> format velocity (leaflet-velocity) ---
 function windToVelocity(la1, lo1, la2, lo2, nx, ny, step, uArr, vArr) {
   const now = new Date().toISOString();
@@ -341,6 +374,8 @@ const PAGE_VIEWER = `<!DOCTYPE html>
     <button class="chip" id="fit">Voir la trace</button>
     <button class="chip" id="meteo">🌬 Météo</button>
     <button class="chip" id="fcBtn">📈 Prévisions</button>
+    <a class="chip" id="expGpx" href="#" download>⤓ GPX</a>
+    <a class="chip" id="expCsv" href="#" download>CSV</a>
     <span class="msg mono" id="pos">—</span>
   </div>
 </div>
@@ -379,6 +414,7 @@ const PAGE_VIEWER = `<!DOCTYPE html>
 <script>
 "use strict";
 var id = new URL(location.href).searchParams.get('id');
+(function(){var g=document.getElementById('expGpx'),c=document.getElementById('expCsv');if(g)g.href='/api/tracks/'+id+'/export?format=gpx';if(c)c.href='/api/tracks/'+id+'/export?format=csv';})();
 var API = ''; // même origine
 var D2R=Math.PI/180,R2D=180/Math.PI,R=6371000;
 function angDist(a,b){var p1=a.lat*D2R,p2=b.lat*D2R,dp=(b.lat-a.lat)*D2R,dl=(b.lon-a.lon)*D2R;
@@ -992,6 +1028,8 @@ const PAGE_FLEET = `<!DOCTYPE html>
   .lgh input{vertical-align:-1px}
   .lgi.off{opacity:.55}
   .sp.offsp{color:#8fb0c2;font-size:11px;font-variant-numeric:normal}
+  .lgexp{margin-top:8px;padding-top:7px;border-top:1px solid var(--line);font-size:11px;color:var(--dim)}
+  .lgexp a{color:#39c0d3;text-decoration:none;font-weight:600}
 </style>
 </head>
 <body>
@@ -1078,6 +1116,7 @@ function renderLegend(){
   ks.forEach(function(k){var b=boats[k];var on=isOnline(b);
     var right=on?((b.last&&b.last[3]!=null)?(Math.round(b.last[3]*10)/10)+' kt':'—'):(b.last?'vu '+fmtAge(b.last[2]):'—');
     html+='<div class="lgi'+(on?'':' off')+'" data-id="'+k+'"><span class="dot" style="background:'+(on?b.color:'#6b7f8c')+'"></span><span>'+esc(b.name)+'</span><span class="sp'+(on?'':' offsp')+'">'+right+'</span></div>';});
+  html+='<div class="lgexp">⤓ Traces flotte : <a href="/api/fleets/'+fid+'/export?format=gpx">GPX</a> · <a href="/api/fleets/'+fid+'/export?format=csv">CSV</a></div>';
   el.innerHTML=html;
   var ntg=$('nameToggle');if(ntg)ntg.onchange=function(){showNames=this.checked;applyNames();};
   var otg=$('onlineToggle');if(otg)otg.onchange=function(){onlineOnly=this.checked;applyVisibility();renderLegend();};
@@ -1295,6 +1334,26 @@ const server = http.createServer(async (req, res) => {
       return;
     }
 
+    const mExport = p.match(/^\/api\/tracks\/([a-f0-9]{16})\/export$/);
+    if (mExport && req.method === 'GET') {
+      const meta = await store.getMeta(mExport[1]); if (!meta) return json(res, 404, { error: 'introuvable' });
+      const points = await store.points(mExport[1]);
+      const fmt = (u.searchParams.get('format') || 'gpx').toLowerCase();
+      const tracks = [{ name: meta.name, points }];
+      if (fmt === 'csv') return sendFile(res, tracksToCSV(tracks, false), 'text/csv', fnameSafe(meta.name) + '.csv');
+      return sendFile(res, tracksToGPX(tracks), 'application/gpx+xml', fnameSafe(meta.name) + '.gpx');
+    }
+    const mFleetExport = p.match(/^\/api\/fleets\/([a-f0-9]{16})\/export$/);
+    if (mFleetExport && req.method === 'GET') {
+      const fleet = await store.fleetGet(mFleetExport[1]); if (!fleet) return json(res, 404, { error: 'flotte introuvable' });
+      const ids = await store.fleetMembers(mFleetExport[1]);
+      const tracks = [];
+      for (const id of ids){ const m = await store.getMeta(id); if (!m) continue; const pts = await store.points(id); if (pts.length) tracks.push({ name: m.name, points: pts }); }
+      const fmt = (u.searchParams.get('format') || 'gpx').toLowerCase();
+      const base = fnameSafe(fleet.name) + '_flotte';
+      if (fmt === 'csv') return sendFile(res, tracksToCSV(tracks, true), 'text/csv', base + '.csv');
+      return sendFile(res, tracksToGPX(tracks), 'application/gpx+xml', base + '.gpx');
+    }
     if (p === '/api/osmand') {
       const params = {};
       u.searchParams.forEach((v, k) => { params[k] = v; });
