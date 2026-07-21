@@ -1007,7 +1007,11 @@ const PAGE_FLEET = `<!DOCTYPE html>
 <title>Suivi de flotte</title>
 <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.css">
 <link rel="stylesheet" href="https://unpkg.com/maplibre-gl/dist/maplibre-gl.css">
+<link rel="stylesheet" href="https://unpkg.com/leaflet-velocity/dist/leaflet-velocity.min.css">
 <style>
+  #windCtl{position:fixed;left:8px;z-index:1200;display:none;background:var(--panel);backdrop-filter:blur(8px);border:1px solid var(--line);border-radius:10px;padding:8px 10px;bottom:calc(env(safe-area-inset-bottom) + 60px)}
+  #windCtl select{background:#0a1e2c;color:var(--ink);border:1px solid var(--line);border-radius:8px;padding:5px 7px;font-size:12px;margin-right:6px}
+  #windCtl .t{font-size:9.5px;text-transform:uppercase;letter-spacing:1px;color:var(--dim);margin-bottom:5px}
   :root{--navy:#0a1a26;--panel:rgba(10,26,38,.92);--line:#1d3a4d;--amber2:#ffc25a;--ink:#e8f1f6;--dim:#8fb0c2}
   *{box-sizing:border-box}
   html,body{margin:0;height:100%;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;background:var(--navy);color:var(--ink)}
@@ -1037,10 +1041,13 @@ const PAGE_FLEET = `<!DOCTYPE html>
 <div class="bar"><b id="flname">Flotte</b><div class="sub" id="flcount">Connexion…</div></div>
 <button class="fitbtn" id="fit">⤢ Tout voir</button>
 <div id="legend"><div class="lgh">Flotte</div></div>
+<div id="windCtl"><div class="t">Vent — modèle (précision) &amp; échéance</div><select id="windModel"></select><select id="windHour"></select></div>
 
 <script src="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.js"></script>
 <script src="https://unpkg.com/maplibre-gl/dist/maplibre-gl.js"></script>
 <script src="https://unpkg.com/@maplibre/maplibre-gl-leaflet/leaflet-maplibre-gl.js"></script>
+<script src="https://unpkg.com/leaflet-velocity/dist/leaflet-velocity.min.js"></script>
+<script src="/config.js"></script>
 <script>
 "use strict";
 var fid=new URLSearchParams(location.search).get('id');
@@ -1064,7 +1071,27 @@ bases['Satellite']=esriSat;
 bases['OpenStreetMap']=osm;
 (bases['Carte marine (isobathes/sondes)']||esriOcean).addTo(map);
 seamark.addTo(map);
-L.control.layers(bases,{'Balises (OpenSeaMap)':seamark,'Balises SHOM':shomBalise},{position:'topright',collapsed:true}).addTo(map);
+var weather={};
+var owmKey=(window.OWM_KEY||'');
+if(owmKey){
+  var owm=function(layer){return L.tileLayer('https://tile.openweathermap.org/map/'+layer+'/{z}/{x}/{y}.png?appid='+owmKey,{opacity:0.55,maxZoom:12,attribution:'Météo &copy; OpenWeather'});};
+  weather['Vent']=owm('wind_new');weather['Pression']=owm('pressure_new');weather['Nuages']=owm('clouds_new');weather['Pluie']=owm('precipitation_new');weather['Température']=owm('temp_new');
+}
+var windGroup=L.layerGroup();
+var overlays=Object.assign({'Balises (OpenSeaMap)':seamark,'Balises SHOM':shomBalise,'Vent animé (Open‑Meteo)':windGroup},weather);
+var layerCtl=L.control.layers(bases,overlays,{position:'topright',collapsed:true}).addTo(map);
+var MODELS=[{v:'best_match',t:'Auto (best match)'},{v:'meteofrance_arome_france_hd',t:'AROME France HD 1.5 km'},{v:'meteofrance_arpege_europe',t:'ARPEGE Europe 11 km'},{v:'icon_eu',t:'ICON-EU 7 km'},{v:'ecmwf_ifs025',t:'ECMWF 25 km'},{v:'gfs_seamless',t:'GFS 25 km'}];
+var HOURS=[{v:0,t:'Maintenant'},{v:6,t:'+6 h'},{v:12,t:'+12 h'},{v:24,t:'+24 h'},{v:48,t:'+48 h'}];
+function fillSel(sel,list,def){list.forEach(function(o){var e=document.createElement('option');e.value=o.v;e.textContent=o.t;if(String(o.v)===String(def))e.selected=true;sel.appendChild(e);});}
+fillSel($('windModel'),MODELS,'best_match');fillSel($('windHour'),HOURS,0);
+var windLayer=null,windBusy=false;
+function windOpts(d){return {displayValues:true,displayOptions:{velocityType:'Vent',position:'bottomleft',emptyString:'—',angleConvention:'bearingCW',speedUnit:'kt'},data:d,minVelocity:0,maxVelocity:18,velocityScale:0.014,opacity:1,lineWidth:2.4,particleAge:110,particleMultiplier:1/170,colorScale:['#3a4cff','#0091ff','#00c2ff','#00e0a0','#61ff3d','#d4ff00','#ffd000','#ff8a00','#ff3b2f','#ff0a78']};}
+function loadWind(){if(!L.velocityLayer)return;windBusy=true;var c=map.getCenter();var model=$('windModel').value,hour=$('windHour').value;fetch('/api/wind?lat='+c.lat.toFixed(2)+'&lon='+c.lng.toFixed(2)+'&model='+encodeURIComponent(model)+'&hour='+hour).then(function(r){return r.json();}).then(function(d){windBusy=false;if(windLayer){windGroup.removeLayer(windLayer);windLayer=null;}windLayer=L.velocityLayer(windOpts(d));windGroup.addLayer(windLayer);}).catch(function(){windBusy=false;});}
+map.on('overlayadd',function(e){if(e.layer!==windGroup)return;$('windCtl').style.display='block';if(!windLayer&&!windBusy)loadWind();});
+map.on('overlayremove',function(e){if(e.layer!==windGroup)return;$('windCtl').style.display='none';if(windLayer){windGroup.removeLayer(windLayer);windLayer=null;}});
+$('windModel').onchange=function(){if(map.hasLayer(windGroup))loadWind();};
+$('windHour').onchange=function(){if(map.hasLayer(windGroup))loadWind();};
+fetch('https://api.rainviewer.com/public/weather-maps.json').then(function(r){return r.json();}).then(function(d){if(d&&d.radar&&d.radar.past&&d.radar.past.length){var fr=d.radar.past[d.radar.past.length-1];var radar=L.tileLayer((d.host||'https://tilecache.rainviewer.com')+fr.path+'/256/{z}/{x}/{y}/2/1_1.png',{opacity:0.6,maxZoom:12,attribution:'Radar &copy; RainViewer'});layerCtl.addOverlay(radar,'Radar pluie');}}).catch(function(){});
 
 /* ---- gestion des bateaux ---- */
 function boatColor(id){var h=0;for(var i=0;i<id.length;i++)h=(h*31+id.charCodeAt(i))>>>0;return 'hsl('+(h%360)+',85%,55%)';}
