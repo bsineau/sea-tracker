@@ -227,6 +227,7 @@ const PAGE_VIEWER = `<!DOCTYPE html>
   <iframe id="windyFrame" title="Windy" style="flex:1;border:0;width:100%"></iframe>
 </div>
 
+<script src="/config.js"></script>
 <script src="/windy.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.js"></script>
 <script>
@@ -252,7 +253,31 @@ function gcInterp(a,b,f){var d=angDist(a,b);if(d<1e-9)return{lat:a.lat,lon:a.lon
 var map=L.map('map',{zoomControl:true,worldCopyJump:true}).setView([46,-20],4);
 var esriOcean=L.tileLayer('https://server.arcgisonline.com/ArcGIS/rest/services/Ocean/World_Ocean_Base/MapServer/tile/{z}/{y}/{x}',{maxZoom:13,attribution:'Fond océan &copy; Esri'}).addTo(map);
 L.tileLayer('https://server.arcgisonline.com/ArcGIS/rest/services/Ocean/World_Ocean_Reference/MapServer/tile/{z}/{y}/{x}',{maxZoom:13}).addTo(map);
-L.tileLayer('https://tiles.openseamap.org/seamark/{z}/{x}/{y}.png',{maxZoom:18,opacity:.9,attribution:'Balisage &copy; OpenSeaMap'}).addTo(map);
+var seamark=L.tileLayer('https://tiles.openseamap.org/seamark/{z}/{x}/{y}.png',{maxZoom:18,opacity:.9,attribution:'Balisage &copy; OpenSeaMap'}).addTo(map);
+
+// --- calques météo superposés (sous le bateau et la trace) ---
+var weather={};
+var owmKey=(window.OWM_KEY||'');
+if(owmKey){
+  var owm=function(layer){return L.tileLayer('https://tile.openweathermap.org/map/'+layer+'/{z}/{x}/{y}.png?appid='+owmKey,
+    {opacity:0.55,maxZoom:12,attribution:'Météo &copy; OpenWeather'});};
+  weather['Vent']=owm('wind_new');
+  weather['Pression']=owm('pressure_new');
+  weather['Nuages']=owm('clouds_new');
+  weather['Pluie']=owm('precipitation_new');
+  weather['Température']=owm('temp_new');
+}
+var layerCtl=L.control.layers({'Océan':esriOcean},Object.assign({'Balises':seamark},weather),
+  {position:'topright',collapsed:true}).addTo(map);
+// Radar pluie RainViewer (sans clé)
+fetch('https://api.rainviewer.com/public/weather-maps.json').then(function(r){return r.json();}).then(function(d){
+  if(d&&d.radar&&d.radar.past&&d.radar.past.length){
+    var f=d.radar.past[d.radar.past.length-1];
+    var radar=L.tileLayer((d.host||'https://tilecache.rainviewer.com')+f.path+'/256/{z}/{x}/{y}/2/1_1.png',
+      {opacity:0.6,maxZoom:12,attribution:'Radar &copy; RainViewer'});
+    layerCtl.addOverlay(radar,'Radar pluie');
+  }
+}).catch(function(){});
 
 var trace=L.polyline([],{color:'#f5a623',weight:3.5,opacity:.95}).addTo(map);
 var startMk=null;
@@ -725,6 +750,7 @@ const server = http.createServer(async (req, res) => {
   } catch (e) { return json(res, 500, { error: 'stockage indisponible' }); }
 
   if (p === '/windy.js') { res.writeHead(200, { 'Content-Type': 'text/javascript; charset=utf-8' }); return res.end(PAGE_WINDYJS); }
+  if (p === '/config.js') { res.writeHead(200, { 'Content-Type': 'text/javascript; charset=utf-8' }); return res.end('window.OWM_KEY=' + JSON.stringify(process.env.OWM_API_KEY || '') + ';'); }
   if (p === '/') return serveHTML(res, PAGE_INDEX);
   if (p === '/v') return serveHTML(res, PAGE_VIEWER);
   if (p === '/p') return serveHTML(res, PAGE_PUBLISHER);
