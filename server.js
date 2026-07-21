@@ -1284,19 +1284,21 @@ const server = http.createServer(async (req, res) => {
       u.searchParams.forEach((v, k) => { params[k] = v; });
       if (req.method === 'POST') {
         const raw = await new Promise((resolve) => { let b = '', n = 0; req.on('data', (c) => { n += c.length; if (n > 1e5) { req.destroy(); resolve(''); } else b += c; }); req.on('end', () => resolve(b)); req.on('error', () => resolve('')); });
-        if (raw) {
-          const ct = req.headers['content-type'] || '';
-          if (ct.indexOf('application/json') >= 0) { try { Object.assign(params, JSON.parse(raw)); } catch {} }
-          else { try { new URLSearchParams(raw).forEach((v, k) => { if (params[k] == null) params[k] = v; }); } catch {} }
+        const body = (raw || '').trim();
+        if (body) {
+          if (body[0] === '{' || body[0] === '[') {
+            try { const j = JSON.parse(body); const o = Array.isArray(j) ? (j[0] || {}) : j; Object.assign(params, o); if (o.location) Object.assign(params, o.location); if (o.location && o.location.coords) Object.assign(params, o.location.coords); } catch {}
+          } else { try { new URLSearchParams(body).forEach((v, k) => { if (params[k] == null) params[k] = v; }); } catch {} }
         }
       }
-      const idp = params.id;
-      const lat = num(parseFloat(params.lat)), lon = num(parseFloat(params.lon));
+      const idp = params.id != null ? params.id : params.deviceId;
+      const lat = num(parseFloat(params.lat != null ? params.lat : params.latitude));
+      const lon = num(parseFloat(params.lon != null ? params.lon : params.longitude));
       if (!idp) { res.writeHead(400, CORS); return res.end('no id'); }
       if (lat === null || lon === null) { res.writeHead(200, CORS); return res.end('OK'); }
-      const tid = await store.devGet(sha(idp));
+      const tid = await store.devGet(sha(String(idp)));
       if (!tid) { res.writeHead(404, CORS); return res.end('device inconnu'); }
-      let t = Date.now(); const ts = params.timestamp;
+      let t = Date.now(); const ts = params.timestamp != null ? params.timestamp : params.time;
       if (ts) { const tss = String(ts); if (/^\d+$/.test(tss)) { const n = parseInt(tss, 10); t = n < 1e12 ? n * 1000 : n; } else { const d = Date.parse(tss.replace(' ', 'T')); if (!isNaN(d)) t = d; } }
       const sog = num(parseFloat(params.speed));
       let cog = num(parseFloat(params.bearing)); if (cog === null) cog = num(parseFloat(params.heading)); if (cog === null) cog = num(parseFloat(params.course));
