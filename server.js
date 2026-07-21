@@ -33,26 +33,37 @@ function windToVelocity(la1, lo1, la2, lo2, nx, ny, step, uArr, vArr) {
     { header: Object.assign({}, base, { parameterNumber: 3, parameterNumberName: 'V-component_of_wind', parameterUnit: 'm.s-1' }), data: vArr }
   ];
 }
-async function fetchWind(clat, clon, model) {
+async function fetchWind(clat, clon, model, hour) {
   const STEP = 1, HALF_LAT = 6, HALF_LON = 8;
   const la1 = Math.round(clat) + HALF_LAT, la2 = Math.round(clat) - HALF_LAT;
   const lo1 = Math.round(clon) - HALF_LON, lo2 = Math.round(clon) + HALF_LON;
   const nx = Math.round((lo2 - lo1) / STEP) + 1, ny = Math.round((la1 - la2) / STEP) + 1;
   const qlat = [], qlon = [];
   for (let la = la1; la >= la2; la -= STEP) for (let lo = lo1; lo <= lo2; lo += STEP) { qlat.push(la); qlon.push(lo); }
-  let url = 'https://api.open-meteo.com/v1/forecast?latitude=' + qlat.join(',') + '&longitude=' + qlon.join(',') + '&current=wind_speed_10m,wind_direction_10m&wind_speed_unit=ms';
-  if (model) url += '&models=' + encodeURIComponent(model);
+  const t = new Date(); t.setUTCMinutes(0, 0, 0); t.setUTCHours(t.getUTCHours() + (hour || 0));
+  const iso = t.toISOString().slice(0, 13) + ':00';
+  let url = 'https://api.open-meteo.com/v1/forecast?latitude=' + qlat.join(',') + '&longitude=' + qlon.join(',')
+    + '&hourly=wind_speed_10m,wind_direction_10m&wind_speed_unit=ms&timezone=GMT&start_hour=' + iso + '&end_hour=' + iso;
+  if (model && model !== 'best_match') url += '&models=' + encodeURIComponent(model);
   const r = await fetch(url); const j = await r.json();
   const arr = Array.isArray(j) ? j : [j];
   const uArr = [], vArr = [];
   for (const pt of arr) {
-    const c = pt && pt.current ? pt.current : {};
-    const sp = num(c.wind_speed_10m) || 0, dr = num(c.wind_direction_10m) || 0;
+    const h = pt && pt.hourly ? pt.hourly : {};
+    const sp = num(h.wind_speed_10m && h.wind_speed_10m[0]) || 0;
+    const dr = num(h.wind_direction_10m && h.wind_direction_10m[0]) || 0;
     const rad = dr * Math.PI / 180;
     uArr.push(-sp * Math.sin(rad));
     vArr.push(-sp * Math.cos(rad));
   }
   return windToVelocity(la1, lo1, la2, lo2, nx, ny, STEP, uArr, vArr);
+}
+async function fetchForecast(clat, clon, model) {
+  let url = 'https://api.open-meteo.com/v1/forecast?latitude=' + clat + '&longitude=' + clon
+    + '&hourly=wind_speed_10m,wind_gusts_10m,wind_direction_10m,pressure_msl,cloud_cover'
+    + '&wind_speed_unit=kn&timezone=auto&forecast_days=4';
+  if (model && model !== 'best_match') url += '&models=' + encodeURIComponent(model);
+  const r = await fetch(url); return await r.json();
 }
 
 /* ---- back-end fichiers ---- */
@@ -246,6 +257,7 @@ const PAGE_VIEWER = `<!DOCTYPE html>
     <button class="chip on" id="follow">⌖ Suivre</button>
     <button class="chip" id="fit">Voir la trace</button>
     <button class="chip" id="meteo">🌬 Météo</button>
+    <button class="chip" id="fcBtn">📈 Prévisions</button>
     <span class="msg mono" id="pos">—</span>
   </div>
 </div>
@@ -258,6 +270,21 @@ const PAGE_VIEWER = `<!DOCTYPE html>
     <button id="windyClose" class="chip">✕</button>
   </div>
   <iframe id="windyFrame" title="Windy" style="flex:1;border:0;width:100%"></iframe>
+</div>
+
+<div id="windCtl" style="position:fixed;left:10px;z-index:1200;display:none;background:var(--panel);backdrop-filter:blur(8px);border:1px solid var(--line);border-radius:10px;padding:8px 10px;bottom:calc(env(safe-area-inset-bottom) + 200px)">
+  <div style="font-size:9.5px;text-transform:uppercase;letter-spacing:1px;color:var(--dim);margin-bottom:5px">Vent — modèle (précision) & échéance</div>
+  <select id="windModel" class="chip" style="margin-right:6px"></select>
+  <select id="windHour" class="chip"></select>
+</div>
+
+<div id="fcSheet" class="sheet" style="display:none;z-index:1400;max-height:72vh;overflow:auto">
+  <div style="display:flex;align-items:center;gap:8px;margin-bottom:8px">
+    <span style="font-weight:700">Prévisions au bateau</span>
+    <select id="fcModel" class="chip" style="margin-left:auto;max-width:52vw"></select>
+    <button id="fcClose" class="chip">✕</button>
+  </div>
+  <div id="fcBody" style="font-size:12px;color:var(--dim)">Chargement…</div>
 </div>
 
 <script src="/config.js"></script>
@@ -326,23 +353,67 @@ var windGroup=L.layerGroup();
 var overlays=Object.assign({'Balises (OpenSeaMap)':seamark,'Balises SHOM':shomBalise,'Vent animé (Open‑Meteo)':windGroup},weather);
 var layerCtl=L.control.layers(bases,overlays,{position:'topright',collapsed:true}).addTo(map);
 // Vent animé (particules) via leaflet-velocity + Open-Meteo
+var MODELS=[{v:'best_match',t:'Auto (best match)'},{v:'meteofrance_arome_france',t:'AROME France 1.3 km'},{v:'meteofrance_arpege_europe',t:'ARPEGE Europe 11 km'},{v:'icon_eu',t:'ICON-EU 7 km'},{v:'ecmwf_ifs025',t:'ECMWF 25 km'},{v:'gfs_seamless',t:'GFS 25 km'}];
+var HOURS=[{v:0,t:'Maintenant'},{v:6,t:'+6 h'},{v:12,t:'+12 h'},{v:24,t:'+24 h'},{v:48,t:'+48 h'}];
+function fillSel(sel,list,def){list.forEach(function(o){var e=document.createElement('option');e.value=o.v;e.textContent=o.t;if(String(o.v)===String(def))e.selected=true;sel.appendChild(e);});}
+fillSel(document.getElementById('windModel'),MODELS,'best_match');
+fillSel(document.getElementById('windHour'),HOURS,0);
+fillSel(document.getElementById('fcModel'),MODELS,'best_match');
+
 var windLayer=null, windBusy=false;
-map.on('overlayadd', function(e){
-  if(e.layer!==windGroup || windLayer || windBusy || !L.velocityLayer) return;
-  windBusy=true;
+function windOpts(d){return {displayValues:true,
+  displayOptions:{velocityType:'Vent',position:'bottomleft',emptyString:'—',angleConvention:'bearingCW',speedUnit:'kt'},
+  data:d, minVelocity:0, maxVelocity:18, velocityScale:0.014, opacity:1,
+  lineWidth:2.4, particleAge:110, particleMultiplier:1/170,
+  colorScale:['#3a4cff','#0091ff','#00c2ff','#00e0a0','#61ff3d','#d4ff00','#ffd000','#ff8a00','#ff3b2f','#ff0a78']};}
+function loadWind(){
+  if(!L.velocityLayer)return; windBusy=true;
   var c=map.getCenter();
-  fetch('/api/wind?lat='+c.lat.toFixed(2)+'&lon='+c.lng.toFixed(2)).then(function(r){return r.json();}).then(function(d){
-    windBusy=false;
-    windLayer=L.velocityLayer({displayValues:true,
-      displayOptions:{velocityType:'Vent',position:'bottomleft',emptyString:'—',angleConvention:'bearingCW',speedUnit:'kt'},
-      data:d,maxVelocity:25,velocityScale:0.012,opacity:0.9});
-    windGroup.addLayer(windLayer);
-  }).catch(function(){windBusy=false;});
-});
-map.on('overlayremove', function(e){
-  if(e.layer!==windGroup) return;
-  if(windLayer){windGroup.removeLayer(windLayer);windLayer=null;}
-});
+  var model=document.getElementById('windModel').value, hour=document.getElementById('windHour').value;
+  fetch('/api/wind?lat='+c.lat.toFixed(2)+'&lon='+c.lng.toFixed(2)+'&model='+encodeURIComponent(model)+'&hour='+hour)
+   .then(function(r){return r.json();}).then(function(d){
+     windBusy=false;
+     if(windLayer){windGroup.removeLayer(windLayer);windLayer=null;}
+     windLayer=L.velocityLayer(windOpts(d)); windGroup.addLayer(windLayer);
+   }).catch(function(){windBusy=false;});
+}
+map.on('overlayadd', function(e){ if(e.layer!==windGroup)return; document.getElementById('windCtl').style.display='block'; if(!windLayer&&!windBusy)loadWind(); });
+map.on('overlayremove', function(e){ if(e.layer!==windGroup)return; document.getElementById('windCtl').style.display='none'; if(windLayer){windGroup.removeLayer(windLayer);windLayer=null;} });
+document.getElementById('windModel').onchange=function(){ if(map.hasLayer(windGroup))loadWind(); };
+document.getElementById('windHour').onchange=function(){ if(map.hasLayer(windGroup))loadWind(); };
+
+function dirArrow(deg){var a=['↓','↙','←','↖','↑','↗','→','↘'];return a[Math.round(((deg||0)%360)/45)%8];}
+function loadForecast(){
+  var body=document.getElementById('fcBody');
+  var last=pts.length?pts[pts.length-1]:null,lat,lon;
+  if(last){lat=last[0];lon=last[1];}else{var c=map.getCenter();lat=c.lat;lon=c.lng;}
+  var model=document.getElementById('fcModel').value;
+  body.textContent='Chargement…';
+  fetch('/api/forecast?lat='+lat.toFixed(3)+'&lon='+lon.toFixed(3)+'&model='+encodeURIComponent(model))
+   .then(function(r){return r.json();}).then(function(d){
+     var h=d.hourly; if(!h||!h.time){body.textContent='Prévision indisponible pour ce modèle sur cette zone.';return;}
+     var html='<table style="width:100%;border-collapse:collapse" class="mono">';
+     html+='<tr style="color:#8fb0c2;font-size:10px;text-align:left"><th>Heure</th><th>Vent</th><th>Raf.</th><th>Dir</th><th>Press.</th><th>Nua.</th></tr>';
+     var curDay='';
+     for(var i=0;i<h.time.length;i+=3){
+       var dt=new Date(h.time[i]);
+       var day=dt.toLocaleDateString('fr-FR',{weekday:'short',day:'2-digit',month:'2-digit'});
+       if(day!==curDay){curDay=day;html+='<tr><td colspan="6" style="padding-top:8px;color:#ffc25a;font-weight:700;font-size:11px">'+day+'</td></tr>';}
+       var w=h.wind_speed_10m&&h.wind_speed_10m[i]!=null?Math.round(h.wind_speed_10m[i]):'—';
+       var g=h.wind_gusts_10m&&h.wind_gusts_10m[i]!=null?Math.round(h.wind_gusts_10m[i]):'—';
+       var dr=h.wind_direction_10m?h.wind_direction_10m[i]:null;
+       var pr=h.pressure_msl&&h.pressure_msl[i]!=null?Math.round(h.pressure_msl[i]):'—';
+       var cl=h.cloud_cover&&h.cloud_cover[i]!=null?h.cloud_cover[i]:'—';
+       var hh=dt.toLocaleTimeString('fr-FR',{hour:'2-digit',minute:'2-digit'});
+       html+='<tr style="border-top:1px solid #12303f"><td style="padding:3px 0;color:#e8f1f6">'+hh+'</td><td style="color:#ffc25a;font-weight:700">'+w+' kt</td><td style="color:#e8f1f6">'+g+'</td><td style="color:#e8f1f6">'+dirArrow(dr)+' '+(dr!=null?Math.round(dr):'—')+'°</td><td style="color:#e8f1f6">'+pr+'</td><td style="color:#e8f1f6">'+cl+'%</td></tr>';
+     }
+     html+='</table>';
+     body.innerHTML=html;
+   }).catch(function(){body.textContent='Erreur de chargement.';});
+}
+document.getElementById('fcBtn').onclick=function(){document.getElementById('fcSheet').style.display='block';loadForecast();};
+document.getElementById('fcClose').onclick=function(){document.getElementById('fcSheet').style.display='none';};
+document.getElementById('fcModel').onchange=loadForecast;
 // Radar pluie RainViewer (sans clé)
 fetch('https://api.rainviewer.com/public/weather-maps.json').then(function(r){return r.json();}).then(function(d){
   if(d&&d.radar&&d.radar.past&&d.radar.past.length){
@@ -826,8 +897,16 @@ const server = http.createServer(async (req, res) => {
       const clat = num(parseFloat(u.searchParams.get('lat')));
       const clon = num(parseFloat(u.searchParams.get('lon')));
       const model = u.searchParams.get('model') || '';
-      const vel = await fetchWind(clat === null ? 47 : clat, clon === null ? -4 : clon, model);
+      const hour = parseInt(u.searchParams.get('hour'), 10) || 0;
+      const vel = await fetchWind(clat === null ? 47 : clat, clon === null ? -4 : clon, model, hour);
       return json(res, 200, vel);
+    }
+    if (p === '/api/forecast' && req.method === 'GET') {
+      const clat = num(parseFloat(u.searchParams.get('lat')));
+      const clon = num(parseFloat(u.searchParams.get('lon')));
+      const model = u.searchParams.get('model') || '';
+      const fc = await fetchForecast(clat === null ? 47 : clat, clon === null ? -4 : clon, model);
+      return json(res, 200, fc);
     }
   } catch (e) { return json(res, 500, { error: 'stockage indisponible' }); }
 
