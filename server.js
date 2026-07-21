@@ -75,10 +75,11 @@ async function fetchWind(clat, clon, model, hour) {
   for (let la = la1; la >= la2; la -= STEP) for (let lo = lo1; lo <= lo2; lo += STEP) { qlat.push(la); qlon.push(lo); }
   hour = hour || 0;
   const days = Math.min(3, Math.max(1, Math.ceil((hour + 6) / 24)));
-  let url = 'https://api.open-meteo.com/v1/forecast?latitude=' + qlat.join(',') + '&longitude=' + qlon.join(',')
+  const base = 'https://api.open-meteo.com/v1/forecast?latitude=' + qlat.join(',') + '&longitude=' + qlon.join(',')
     + '&hourly=wind_speed_10m,wind_direction_10m&wind_speed_unit=ms&timezone=GMT&forecast_days=' + days;
-  if (model && model !== 'best_match') url += '&models=' + encodeURIComponent(model);
-  const r = await fetch(url); const j = await r.json();
+  const url = base + ((model && model !== 'best_match') ? '&models=' + encodeURIComponent(model) : '');
+  let j = await (await fetch(url)).json();
+  if (j && (j.error || (!Array.isArray(j) && !j.hourly))) j = await (await fetch(base)).json();
   const arr = Array.isArray(j) ? j : [j];
   const t = new Date(); t.setUTCMinutes(0, 0, 0); t.setUTCHours(t.getUTCHours() + hour);
   const target = t.toISOString().slice(0, 13) + ':00';
@@ -148,6 +149,7 @@ const fileStore = {
   fleetGet: async (fid) => { const f = fleetLoad(fid); return f ? { id: f.id, name: f.name, createdAt: f.createdAt } : null; },
   fleetAdd: async (fid, tid) => { const f = fleetLoad(fid); if (!f) return; if (f.members.indexOf(tid) < 0) { f.members.push(tid); fs.writeFileSync(fltPath(fid), JSON.stringify(f)); } },
   fleetMembers: async (fid) => { const f = fleetLoad(fid); return f ? f.members : []; },
+  fleetRemove: async (fid, tid) => { const f = fleetLoad(fid); if (!f) return; f.members = f.members.filter((x) => x !== tid); fs.writeFileSync(fltPath(fid), JSON.stringify(f)); },
   devSet: async (kh, tid) => { let d = {}; try { d = JSON.parse(fs.readFileSync(path.join(DATA, 'devices.json'), 'utf8')); } catch {} d[kh] = tid; fs.writeFileSync(path.join(DATA, 'devices.json'), JSON.stringify(d)); },
   devGet: async (kh) => { try { const d = JSON.parse(fs.readFileSync(path.join(DATA, 'devices.json'), 'utf8')); return d[kh] || null; } catch { return null; } }
 };
@@ -178,6 +180,7 @@ const redisStore = {
   fleetGet: async (fid) => { const s = await redisCmd(['GET', rFlt(fid)]); return s ? JSON.parse(s) : null; },
   fleetAdd: async (fid, tid) => { await redisCmd(['RPUSH', rFltM(fid), tid]); },
   fleetMembers: async (fid) => { const a = await redisCmd(['LRANGE', rFltM(fid), '0', '-1']); return a || []; },
+  fleetRemove: async (fid, tid) => { await redisCmd(['LREM', rFltM(fid), '0', tid]); },
   devSet: async (kh, tid) => { await redisCmd(['SET', 'dev:' + kh, tid]); },
   devGet: async (kh) => { return await redisCmd(['GET', 'dev:' + kh]); }
 };
@@ -1034,6 +1037,8 @@ const PAGE_FLEET = `<!DOCTYPE html>
   .sp.offsp{color:#8fb0c2;font-size:11px;font-variant-numeric:normal}
   .lgexp{margin-top:8px;padding-top:7px;border-top:1px solid var(--line);font-size:11px;color:var(--dim)}
   .lgexp a{color:#39c0d3;text-decoration:none;font-weight:600}
+  .del{margin-left:8px;color:#5f7482;cursor:pointer}
+  .del:hover,.del:active{color:#e6584c}
 </style>
 </head>
 <body>
@@ -1145,13 +1150,15 @@ function renderLegend(){
   ks.sort(function(a,bk){return (boats[a].name||'').localeCompare(boats[bk].name||'');});
   ks.forEach(function(k){var b=boats[k];var on=isOnline(b);
     var right=on?((b.last&&b.last[3]!=null)?(Math.round(b.last[3]*10)/10)+' kt':'—'):(b.last?'vu '+fmtAge(b.last[2]):'—');
-    html+='<div class="lgi'+(on?'':' off')+'" data-id="'+k+'"><span class="dot" style="background:'+(on?b.color:'#6b7f8c')+'"></span><span>'+esc(b.name)+'</span><span class="sp'+(on?'':' offsp')+'">'+right+'</span></div>';});
+    html+='<div class="lgi'+(on?'':' off')+'" data-id="'+k+'"><span class="dot" style="background:'+(on?b.color:'#6b7f8c')+'"></span><span>'+esc(b.name)+'</span><span class="sp'+(on?'':' offsp')+'">'+right+'</span><span class="del" data-del="'+k+'" title="Retirer de la flotte">✕</span></div>';});
   html+='<div class="lgexp">⤓ Traces flotte : <a href="/api/fleets/'+fid+'/export?format=gpx">GPX</a> · <a href="/api/fleets/'+fid+'/export?format=csv">CSV</a></div>';
   el.innerHTML=html;
   var ntg=$('nameToggle');if(ntg)ntg.onchange=function(){showNames=this.checked;applyNames();};
   var otg=$('onlineToggle');if(otg)otg.onchange=function(){onlineOnly=this.checked;applyVisibility();renderLegend();};
   var rows=el.querySelectorAll('.lgi');
   for(var i=0;i<rows.length;i++){rows[i].onclick=function(){var b=boats[this.getAttribute('data-id')];if(b&&b.last)map.setView([b.last[0],b.last[1]],Math.max(map.getZoom(),12));};}
+  var dels=el.querySelectorAll('.del');
+  for(var d=0;d<dels.length;d++){dels[d].onclick=function(ev){ev.stopPropagation();var did=this.getAttribute('data-del');var b=boats[did];if(!confirm('Retirer '+((b&&b.name)||'ce bateau')+' de la flotte ?'))return;fetch('/api/fleets/'+fid+'/remove',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({trackId:did})}).then(function(){if(b){if(b.marker)map.removeLayer(b.marker);if(b.trace)map.removeLayer(b.trace);}delete boats[did];renderLegend();}).catch(function(){});};}
 }
 function refreshStatus(){for(var k in boats)updateBoatStyle(boats[k]);applyVisibility();renderLegend();}
 setInterval(refreshStatus,30000);
@@ -1327,6 +1334,14 @@ const server = http.createServer(async (req, res) => {
       const fm = { id: fid, name: (body.name || 'Flotte').toString().slice(0, 80), createdAt: Date.now() };
       await store.fleetCreate(fm);
       return json(res, 201, fm);
+    }
+    const mFleetRemove = p.match(/^\/api\/fleets\/([a-f0-9]{16})\/remove$/);
+    if (mFleetRemove && req.method === 'POST') {
+      let body; try { body = await readBody(req); } catch { return json(res, 400, { error: 'json' }); }
+      const tid = String(body.trackId || '');
+      if (!/^[a-f0-9]{16}$/.test(tid)) return json(res, 400, { error: 'trackId invalide' });
+      await store.fleetRemove(mFleetRemove[1], tid);
+      return json(res, 200, { ok: true });
     }
     const mFleetJoin = p.match(/^\/api\/fleets\/([a-f0-9]{16})\/join$/);
     const mFleet = p.match(/^\/api\/fleets\/([a-f0-9]{16})$/);
