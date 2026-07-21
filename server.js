@@ -986,6 +986,10 @@ const PAGE_FLEET = `<!DOCTYPE html>
   .sp{margin-left:auto;color:var(--amber2);font-variant-numeric:tabular-nums;font-size:12px}
   .fitbtn{position:fixed;left:8px;bottom:calc(env(safe-area-inset-bottom) + 8px);z-index:1200;background:var(--panel);backdrop-filter:blur(8px);border:1px solid var(--line);border-radius:10px;color:var(--ink);padding:9px 12px;font-size:13px;cursor:pointer}
   .leaflet-container{background:#0a1a26}
+  .leaflet-tooltip.boat-name{background:rgba(10,26,38,.82);border:0;color:#fff;font-weight:700;font-size:11px;padding:1px 6px;border-radius:6px;box-shadow:none;white-space:nowrap}
+  .leaflet-tooltip.boat-name:before{display:none}
+  .lgh label{text-transform:none;letter-spacing:0;cursor:pointer}
+  .lgh input{vertical-align:-1px}
 </style>
 </head>
 <body>
@@ -1026,6 +1030,7 @@ L.control.layers(bases,{'Balises (OpenSeaMap)':seamark,'Balises SHOM':shomBalise
 function boatColor(id){var h=0;for(var i=0;i<id.length;i++)h=(h*31+id.charCodeAt(i))>>>0;return 'hsl('+(h%360)+',85%,55%)';}
 function esc(s){return (s||'').replace(/[&<>]/g,function(c){return {'&':'&amp;','<':'&lt;','>':'&gt;'}[c];});}
 var boats={};
+var showNames=true;
 function ensureBoat(id,name){
   if(boats[id]){if(name)boats[id].name=name;return boats[id];}
   var c=boatColor(id);
@@ -1038,18 +1043,21 @@ function boatAdd(id,name,p){
   b.trace.addLatLng(ll);
   if(!b.marker){
     b.marker=L.circleMarker(ll,{radius:6,color:'#fff',weight:1.6,fillColor:b.color,fillOpacity:1}).addTo(map)
-      .bindTooltip(b.name,{direction:'top',offset:[0,-6]});
-  } else { b.marker.setLatLng(ll); }
+      .bindTooltip(b.name,{permanent:true,direction:'right',offset:[9,0],className:'boat-name'});
+    if(!showNames) b.marker.closeTooltip();
+  } else { b.marker.setLatLng(ll); b.marker.setTooltipContent(b.name); }
   b.last=p;
   renderLegend();
 }
+function applyNames(){for(var k in boats){var b=boats[k];if(b.marker){if(showNames)b.marker.openTooltip();else b.marker.closeTooltip();}}}
 function renderLegend(){
   var el=$('legend');var ks=Object.keys(boats);
-  var html='<div class="lgh">'+ks.length+' bateau'+(ks.length>1?'x':'')+'</div>';
+  var html='<div class="lgh">'+ks.length+' bateau'+(ks.length>1?'x':'')+' · <label><input type="checkbox" id="nameToggle"'+(showNames?' checked':'')+'> Noms</label></div>';
   ks.sort(function(a,bk){return (boats[a].name||'').localeCompare(boats[bk].name||'');});
   ks.forEach(function(k){var b=boats[k];var sog=(b.last&&b.last[3]!=null)?(Math.round(b.last[3]*10)/10)+' kt':'—';
     html+='<div class="lgi" data-id="'+k+'"><span class="dot" style="background:'+b.color+'"></span><span>'+esc(b.name)+'</span><span class="sp">'+sog+'</span></div>';});
   el.innerHTML=html;
+  var ntg=$('nameToggle');if(ntg)ntg.onchange=function(){showNames=this.checked;applyNames();};
   var rows=el.querySelectorAll('.lgi');
   for(var i=0;i<rows.length;i++){rows[i].onclick=function(){var b=boats[this.getAttribute('data-id')];if(b&&b.last)map.setView([b.last[0],b.last[1]],Math.max(map.getZoom(),12));};}
 }
