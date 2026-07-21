@@ -114,7 +114,9 @@ const fileStore = {
   fleetCreate: async (m) => { const f = Object.assign({ members: [] }, m); fleetCache.set(m.id, f); fs.writeFileSync(fltPath(m.id), JSON.stringify(f)); },
   fleetGet: async (fid) => { const f = fleetLoad(fid); return f ? { id: f.id, name: f.name, createdAt: f.createdAt } : null; },
   fleetAdd: async (fid, tid) => { const f = fleetLoad(fid); if (!f) return; if (f.members.indexOf(tid) < 0) { f.members.push(tid); fs.writeFileSync(fltPath(fid), JSON.stringify(f)); } },
-  fleetMembers: async (fid) => { const f = fleetLoad(fid); return f ? f.members : []; }
+  fleetMembers: async (fid) => { const f = fleetLoad(fid); return f ? f.members : []; },
+  devSet: async (kh, tid) => { let d = {}; try { d = JSON.parse(fs.readFileSync(path.join(DATA, 'devices.json'), 'utf8')); } catch {} d[kh] = tid; fs.writeFileSync(path.join(DATA, 'devices.json'), JSON.stringify(d)); },
+  devGet: async (kh) => { try { const d = JSON.parse(fs.readFileSync(path.join(DATA, 'devices.json'), 'utf8')); return d[kh] || null; } catch { return null; } }
 };
 
 /* ---- back-end Upstash Redis (REST) ---- */
@@ -142,7 +144,9 @@ const redisStore = {
   fleetCreate: async (m) => { await redisCmd(['SET', rFlt(m.id), JSON.stringify(m)]); },
   fleetGet: async (fid) => { const s = await redisCmd(['GET', rFlt(fid)]); return s ? JSON.parse(s) : null; },
   fleetAdd: async (fid, tid) => { await redisCmd(['RPUSH', rFltM(fid), tid]); },
-  fleetMembers: async (fid) => { const a = await redisCmd(['LRANGE', rFltM(fid), '0', '-1']); return a || []; }
+  fleetMembers: async (fid) => { const a = await redisCmd(['LRANGE', rFltM(fid), '0', '-1']); return a || []; },
+  devSet: async (kh, tid) => { await redisCmd(['SET', 'dev:' + kh, tid]); },
+  devGet: async (kh) => { return await redisCmd(['GET', 'dev:' + kh]); }
 };
 const store = USE_REDIS ? redisStore : fileStore;
 const fleetClients = new Map();
@@ -1132,6 +1136,7 @@ const server = http.createServer(async (req, res) => {
       const id = id16(), publishKey = key24();
       const meta = { id, name: (body.name || 'Navigation').toString().slice(0, 80), keyHash: sha(publishKey), createdAt: Date.now(), fleets: [] };
       await store.create(meta);
+      await store.devSet(meta.keyHash, id);
       return json(res, 201, { id, publishKey, name: meta.name });
     }
     const mTrack = p.match(/^\/api\/tracks\/([a-f0-9]{16})$/);
@@ -1191,6 +1196,7 @@ const server = http.createServer(async (req, res) => {
       const meta = { id, name: (body.name || 'Bateau').toString().slice(0, 80), keyHash: sha(publishKey), createdAt: Date.now(), fleets: [fid] };
       await store.create(meta);
       await store.fleetAdd(fid, id);
+      await store.devSet(meta.keyHash, id);
       return json(res, 201, { id, publishKey, name: meta.name, fleet: fid });
     }
     if (mFleet && req.method === 'GET') {
@@ -1215,6 +1221,24 @@ const server = http.createServer(async (req, res) => {
       return;
     }
 
+    if (p === '/api/osmand') {
+      const q = u.searchParams;
+      const idp = q.get('id');
+      const lat = num(parseFloat(q.get('lat'))), lon = num(parseFloat(q.get('lon')));
+      if (!idp || lat === null || lon === null) { res.writeHead(400, CORS); return res.end('bad request'); }
+      const tid = await store.devGet(sha(idp));
+      if (!tid) { res.writeHead(404, CORS); return res.end('device inconnu'); }
+      let t = Date.now(); const ts = q.get('timestamp');
+      if (ts) { if (/^\d+$/.test(ts)) { const n = parseInt(ts, 10); t = n < 1e12 ? n * 1000 : n; } else { const d = Date.parse(ts.replace(' ', 'T')); if (!isNaN(d)) t = d; } }
+      const sog = num(parseFloat(q.get('speed')));
+      const cog = num(parseFloat(q.get('bearing'))) === null ? num(parseFloat(q.get('heading'))) : num(parseFloat(q.get('bearing')));
+      const pt = [r6(lat), r6(lon), Math.round(t), sog === null ? null : Math.round(sog * 10) / 10, cog === null ? null : Math.round(cog)];
+      const meta = await store.getMeta(tid);
+      await store.append(tid, [pt]);
+      broadcast(tid, pt);
+      if (meta && meta.fleets && meta.fleets.length) for (const fid of meta.fleets) broadcastFleet(fid, { b: tid, n: meta.name, p: pt });
+      res.writeHead(200, CORS); return res.end('OK');
+    }
     if (p === '/api/wind' && req.method === 'GET') {
       const clat = num(parseFloat(u.searchParams.get('lat')));
       const clon = num(parseFloat(u.searchParams.get('lon')));
