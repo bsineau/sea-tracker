@@ -24,6 +24,37 @@ const sha = (s) => crypto.createHash('sha256').update(String(s)).digest('hex');
 const num = (v) => (typeof v === 'number' && isFinite(v)) ? v : null;
 const r6 = (v) => Math.round(v * 1e6) / 1e6;
 
+// --- Vent animé : grille Open-Meteo -> format velocity (leaflet-velocity) ---
+function windToVelocity(la1, lo1, la2, lo2, nx, ny, step, uArr, vArr) {
+  const now = new Date().toISOString();
+  const base = { parameterCategory: 2, dx: step, dy: step, nx: nx, ny: ny, lo1: lo1, la1: la1, lo2: lo2, la2: la2, refTime: now, forecastTime: 0 };
+  return [
+    { header: Object.assign({}, base, { parameterNumber: 2, parameterNumberName: 'U-component_of_wind', parameterUnit: 'm.s-1' }), data: uArr },
+    { header: Object.assign({}, base, { parameterNumber: 3, parameterNumberName: 'V-component_of_wind', parameterUnit: 'm.s-1' }), data: vArr }
+  ];
+}
+async function fetchWind(clat, clon, model) {
+  const STEP = 1, HALF_LAT = 6, HALF_LON = 8;
+  const la1 = Math.round(clat) + HALF_LAT, la2 = Math.round(clat) - HALF_LAT;
+  const lo1 = Math.round(clon) - HALF_LON, lo2 = Math.round(clon) + HALF_LON;
+  const nx = Math.round((lo2 - lo1) / STEP) + 1, ny = Math.round((la1 - la2) / STEP) + 1;
+  const qlat = [], qlon = [];
+  for (let la = la1; la >= la2; la -= STEP) for (let lo = lo1; lo <= lo2; lo += STEP) { qlat.push(la); qlon.push(lo); }
+  let url = 'https://api.open-meteo.com/v1/forecast?latitude=' + qlat.join(',') + '&longitude=' + qlon.join(',') + '&current=wind_speed_10m,wind_direction_10m&wind_speed_unit=ms';
+  if (model) url += '&models=' + encodeURIComponent(model);
+  const r = await fetch(url); const j = await r.json();
+  const arr = Array.isArray(j) ? j : [j];
+  const uArr = [], vArr = [];
+  for (const pt of arr) {
+    const c = pt && pt.current ? pt.current : {};
+    const sp = num(c.wind_speed_10m) || 0, dr = num(c.wind_direction_10m) || 0;
+    const rad = dr * Math.PI / 180;
+    uArr.push(-sp * Math.sin(rad));
+    vArr.push(-sp * Math.cos(rad));
+  }
+  return windToVelocity(la1, lo1, la2, lo2, nx, ny, STEP, uArr, vArr);
+}
+
 /* ---- back-end fichiers ---- */
 const fileCache = new Map();
 const fpath = (id) => path.join(DATA, id + '.json');
@@ -159,6 +190,7 @@ const PAGE_VIEWER = `<!DOCTYPE html>
 <title>Suivi en direct</title>
 <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.css">
 <link rel="stylesheet" href="https://unpkg.com/maplibre-gl/dist/maplibre-gl.css">
+<link rel="stylesheet" href="https://unpkg.com/leaflet-velocity/dist/leaflet-velocity.min.css">
 <style>
   :root{--navy:#0a1a26;--navy2:#0e2636;--panel:rgba(10,26,38,.92);--line:#1d3a4d;
     --amber:#f5a623;--amber2:#ffc25a;--cyan:#39c0d3;--ink:#e8f1f6;--dim:#8fb0c2;--green:#37c871;--red:#e6584c}
@@ -233,6 +265,7 @@ const PAGE_VIEWER = `<!DOCTYPE html>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.js"></script>
 <script src="https://unpkg.com/maplibre-gl/dist/maplibre-gl.js"></script>
 <script src="https://unpkg.com/@maplibre/maplibre-gl-leaflet/leaflet-maplibre-gl.js"></script>
+<script src="https://unpkg.com/leaflet-velocity/dist/leaflet-velocity.min.js"></script>
 <script>
 "use strict";
 var id = new URL(location.href).searchParams.get('id');
@@ -289,8 +322,27 @@ bases['Océan (Esri)']=esriOcean;
 bases['Bathymétrie (EMODnet)']=emodnet;
 bases['Satellite']=esriSat;
 bases['OpenStreetMap']=osm;
-var overlays=Object.assign({'Balises (OpenSeaMap)':seamark,'Balises SHOM':shomBalise},weather);
+var windGroup=L.layerGroup();
+var overlays=Object.assign({'Balises (OpenSeaMap)':seamark,'Balises SHOM':shomBalise,'Vent animé (Open‑Meteo)':windGroup},weather);
 var layerCtl=L.control.layers(bases,overlays,{position:'topright',collapsed:true}).addTo(map);
+// Vent animé (particules) via leaflet-velocity + Open-Meteo
+var windLayer=null, windBusy=false;
+map.on('overlayadd', function(e){
+  if(e.layer!==windGroup || windLayer || windBusy || !L.velocityLayer) return;
+  windBusy=true;
+  var c=map.getCenter();
+  fetch('/api/wind?lat='+c.lat.toFixed(2)+'&lon='+c.lng.toFixed(2)).then(function(r){return r.json();}).then(function(d){
+    windBusy=false;
+    windLayer=L.velocityLayer({displayValues:true,
+      displayOptions:{velocityType:'Vent',position:'bottomleft',emptyString:'—',angleConvention:'bearingCW',speedUnit:'kt'},
+      data:d,maxVelocity:25,velocityScale:0.012,opacity:0.9});
+    windGroup.addLayer(windLayer);
+  }).catch(function(){windBusy=false;});
+});
+map.on('overlayremove', function(e){
+  if(e.layer!==windGroup) return;
+  if(windLayer){windGroup.removeLayer(windLayer);windLayer=null;}
+});
 // Radar pluie RainViewer (sans clé)
 fetch('https://api.rainviewer.com/public/weather-maps.json').then(function(r){return r.json();}).then(function(d){
   if(d&&d.radar&&d.radar.past&&d.radar.past.length){
@@ -768,6 +820,14 @@ const server = http.createServer(async (req, res) => {
       const ping = setInterval(() => { try { res.write(': ping\n\n'); } catch {} }, 25000);
       req.on('close', () => { clearInterval(ping); const s = clients.get(meta.id); if (s) s.delete(res); });
       return;
+    }
+
+    if (p === '/api/wind' && req.method === 'GET') {
+      const clat = num(parseFloat(u.searchParams.get('lat')));
+      const clon = num(parseFloat(u.searchParams.get('lon')));
+      const model = u.searchParams.get('model') || '';
+      const vel = await fetchWind(clat === null ? 47 : clat, clon === null ? -4 : clon, model);
+      return json(res, 200, vel);
     }
   } catch (e) { return json(res, 500, { error: 'stockage indisponible' }); }
 
