@@ -40,30 +40,39 @@ async function fetchWind(clat, clon, model, hour) {
   const nx = Math.round((lo2 - lo1) / STEP) + 1, ny = Math.round((la1 - la2) / STEP) + 1;
   const qlat = [], qlon = [];
   for (let la = la1; la >= la2; la -= STEP) for (let lo = lo1; lo <= lo2; lo += STEP) { qlat.push(la); qlon.push(lo); }
-  const t = new Date(); t.setUTCMinutes(0, 0, 0); t.setUTCHours(t.getUTCHours() + (hour || 0));
-  const iso = t.toISOString().slice(0, 13) + ':00';
+  hour = hour || 0;
+  const days = Math.min(3, Math.max(1, Math.ceil((hour + 6) / 24)));
   let url = 'https://api.open-meteo.com/v1/forecast?latitude=' + qlat.join(',') + '&longitude=' + qlon.join(',')
-    + '&hourly=wind_speed_10m,wind_direction_10m&wind_speed_unit=ms&timezone=GMT&start_hour=' + iso + '&end_hour=' + iso;
+    + '&hourly=wind_speed_10m,wind_direction_10m&wind_speed_unit=ms&timezone=GMT&forecast_days=' + days;
   if (model && model !== 'best_match') url += '&models=' + encodeURIComponent(model);
   const r = await fetch(url); const j = await r.json();
   const arr = Array.isArray(j) ? j : [j];
+  const t = new Date(); t.setUTCMinutes(0, 0, 0); t.setUTCHours(t.getUTCHours() + hour);
+  const target = t.toISOString().slice(0, 13) + ':00';
+  let idx = 0;
+  const times = arr[0] && arr[0].hourly && arr[0].hourly.time;
+  if (times) { const p = times.indexOf(target); if (p >= 0) idx = p; }
   const uArr = [], vArr = [];
   for (const pt of arr) {
     const h = pt && pt.hourly ? pt.hourly : {};
-    const sp = num(h.wind_speed_10m && h.wind_speed_10m[0]) || 0;
-    const dr = num(h.wind_direction_10m && h.wind_direction_10m[0]) || 0;
+    const sp = num(h.wind_speed_10m && h.wind_speed_10m[idx]) || 0;
+    const dr = num(h.wind_direction_10m && h.wind_direction_10m[idx]) || 0;
     const rad = dr * Math.PI / 180;
     uArr.push(-sp * Math.sin(rad));
     vArr.push(-sp * Math.cos(rad));
   }
   return windToVelocity(la1, lo1, la2, lo2, nx, ny, STEP, uArr, vArr);
 }
-async function fetchForecast(clat, clon, model) {
+async function omForecast(clat, clon, model, vars) {
   let url = 'https://api.open-meteo.com/v1/forecast?latitude=' + clat + '&longitude=' + clon
-    + '&hourly=wind_speed_10m,wind_gusts_10m,wind_direction_10m,pressure_msl,cloud_cover'
-    + '&wind_speed_unit=kn&timezone=auto&forecast_days=4';
+    + '&hourly=' + vars + '&wind_speed_unit=kn&timezone=auto&forecast_days=4';
   if (model && model !== 'best_match') url += '&models=' + encodeURIComponent(model);
   const r = await fetch(url); return await r.json();
+}
+async function fetchForecast(clat, clon, model) {
+  let d = await omForecast(clat, clon, model, 'wind_speed_10m,wind_gusts_10m,wind_direction_10m,pressure_msl,cloud_cover');
+  if (d && d.error) d = await omForecast(clat, clon, model, 'wind_speed_10m,wind_direction_10m,pressure_msl,cloud_cover');
+  return d;
 }
 
 /* ---- back-end fichiers ---- */
@@ -353,7 +362,7 @@ var windGroup=L.layerGroup();
 var overlays=Object.assign({'Balises (OpenSeaMap)':seamark,'Balises SHOM':shomBalise,'Vent animé (Open‑Meteo)':windGroup},weather);
 var layerCtl=L.control.layers(bases,overlays,{position:'topright',collapsed:true}).addTo(map);
 // Vent animé (particules) via leaflet-velocity + Open-Meteo
-var MODELS=[{v:'best_match',t:'Auto (best match)'},{v:'meteofrance_arome_france',t:'AROME France 1.3 km'},{v:'meteofrance_arpege_europe',t:'ARPEGE Europe 11 km'},{v:'icon_eu',t:'ICON-EU 7 km'},{v:'ecmwf_ifs025',t:'ECMWF 25 km'},{v:'gfs_seamless',t:'GFS 25 km'}];
+var MODELS=[{v:'best_match',t:'Auto (best match)'},{v:'meteofrance_arome_france_hd',t:'AROME France HD 1.5 km'},{v:'meteofrance_arpege_europe',t:'ARPEGE Europe 11 km'},{v:'icon_eu',t:'ICON-EU 7 km'},{v:'ecmwf_ifs025',t:'ECMWF 25 km'},{v:'gfs_seamless',t:'GFS 25 km'}];
 var HOURS=[{v:0,t:'Maintenant'},{v:6,t:'+6 h'},{v:12,t:'+12 h'},{v:24,t:'+24 h'},{v:48,t:'+48 h'}];
 function fillSel(sel,list,def){list.forEach(function(o){var e=document.createElement('option');e.value=o.v;e.textContent=o.t;if(String(o.v)===String(def))e.selected=true;sel.appendChild(e);});}
 fillSel(document.getElementById('windModel'),MODELS,'best_match');
