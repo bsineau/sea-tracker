@@ -1111,7 +1111,10 @@ function applyNames(){for(var k in boats){var b=boats[k];if(b.marker){if(showNam
 function renderLegend(){
   var el=$('legend');
   var ks=Object.keys(boats).filter(function(k){return !onlineOnly||isOnline(boats[k]);});
-  var html='<div class="lgh">'+ks.length+' bateau'+(ks.length>1?'x':'')+' · <label><input type="checkbox" id="nameToggle"'+(showNames?' checked':'')+'> Noms</label> · <label><input type="checkbox" id="onlineToggle"'+(onlineOnly?' checked':'')+'> En ligne</label></div>';
+  var total=Object.keys(boats).length,hidden=total-ks.length;
+  var head=ks.length+' bateau'+(ks.length>1?'x':'');
+  if(onlineOnly&&hidden>0)head+=' · '+hidden+' masqué'+(hidden>1?'s':'');
+  var html='<div class="lgh">'+head+' · <label><input type="checkbox" id="nameToggle"'+(showNames?' checked':'')+'> Noms</label> · <label><input type="checkbox" id="onlineToggle"'+(onlineOnly?' checked':'')+'> Émet</label></div>';
   ks.sort(function(a,bk){return (boats[a].name||'').localeCompare(boats[bk].name||'');});
   ks.forEach(function(k){var b=boats[k];var on=isOnline(b);
     var right=on?((b.last&&b.last[3]!=null)?(Math.round(b.last[3]*10)/10)+' kt':'—'):(b.last?'vu '+fmtAge(b.last[2]):'—');
