@@ -93,21 +93,35 @@ async function fetchPoint(lat, lon) {
 
 /* ---- back-end fichiers ---- */
 const fileCache = new Map();
+const fleetCache = new Map();
 const fpath = (id) => path.join(DATA, id + '.json');
+const fltPath = (id) => path.join(DATA, 'flt_' + id + '.json');
 function fileLoad(id) {
   if (fileCache.has(id)) return fileCache.get(id);
   try { const t = JSON.parse(fs.readFileSync(fpath(id), 'utf8')); fileCache.set(id, t); return t; } catch { return null; }
 }
+function fleetLoad(id) {
+  if (fleetCache.has(id)) return fleetCache.get(id);
+  try { const t = JSON.parse(fs.readFileSync(fltPath(id), 'utf8')); fleetCache.set(id, t); return t; } catch { return null; }
+}
 const fileStore = {
-  getMeta: async (id) => { const t = fileLoad(id); return t ? { id: t.id, name: t.name, keyHash: t.keyHash, createdAt: t.createdAt } : null; },
+  getMeta: async (id) => { const t = fileLoad(id); return t ? { id: t.id, name: t.name, keyHash: t.keyHash, createdAt: t.createdAt, fleets: t.fleets || [] } : null; },
   create: async (m) => { const t = Object.assign({ points: [] }, m); fileCache.set(m.id, t); fs.writeFileSync(fpath(m.id), JSON.stringify(t)); },
+  setMeta: async (m) => { const t = fileLoad(m.id); if (!t) return; t.name = m.name; t.keyHash = m.keyHash; t.createdAt = m.createdAt; t.fleets = m.fleets || []; fs.writeFileSync(fpath(m.id), JSON.stringify(t)); },
   append: async (id, pts) => { const t = fileLoad(id); if (!t) return 0; for (const p of pts) t.points.push(p); fs.writeFileSync(fpath(id), JSON.stringify(t)); return t.points.length; },
-  points: async (id) => { const t = fileLoad(id); return t ? t.points : []; }
+  points: async (id) => { const t = fileLoad(id); return t ? t.points : []; },
+  lastPoint: async (id) => { const t = fileLoad(id); return t && t.points.length ? t.points[t.points.length - 1] : null; },
+  fleetCreate: async (m) => { const f = Object.assign({ members: [] }, m); fleetCache.set(m.id, f); fs.writeFileSync(fltPath(m.id), JSON.stringify(f)); },
+  fleetGet: async (fid) => { const f = fleetLoad(fid); return f ? { id: f.id, name: f.name, createdAt: f.createdAt } : null; },
+  fleetAdd: async (fid, tid) => { const f = fleetLoad(fid); if (!f) return; if (f.members.indexOf(tid) < 0) { f.members.push(tid); fs.writeFileSync(fltPath(fid), JSON.stringify(f)); } },
+  fleetMembers: async (fid) => { const f = fleetLoad(fid); return f ? f.members : []; }
 };
 
 /* ---- back-end Upstash Redis (REST) ---- */
 const rMeta = (id) => 'st:' + id + ':meta';
 const rPts = (id) => 'st:' + id + ':pts';
+const rFlt = (id) => 'flt:' + id + ':meta';
+const rFltM = (id) => 'flt:' + id + ':members';
 async function redisCmd(cmd) {
   const res = await fetch(process.env.UPSTASH_REDIS_REST_URL, {
     method: 'POST',
@@ -121,10 +135,22 @@ async function redisCmd(cmd) {
 const redisStore = {
   getMeta: async (id) => { const s = await redisCmd(['GET', rMeta(id)]); return s ? JSON.parse(s) : null; },
   create: async (m) => { await redisCmd(['SET', rMeta(m.id), JSON.stringify(m)]); },
+  setMeta: async (m) => { await redisCmd(['SET', rMeta(m.id), JSON.stringify(m)]); },
   append: async (id, pts) => { const a = ['RPUSH', rPts(id)]; for (const p of pts) a.push(JSON.stringify(p)); return await redisCmd(a); },
-  points: async (id) => { const arr = await redisCmd(['LRANGE', rPts(id), '0', '-1']); return (arr || []).map((x) => JSON.parse(x)); }
+  points: async (id) => { const arr = await redisCmd(['LRANGE', rPts(id), '0', '-1']); return (arr || []).map((x) => JSON.parse(x)); },
+  lastPoint: async (id) => { const v = await redisCmd(['LINDEX', rPts(id), '-1']); return v ? JSON.parse(v) : null; },
+  fleetCreate: async (m) => { await redisCmd(['SET', rFlt(m.id), JSON.stringify(m)]); },
+  fleetGet: async (fid) => { const s = await redisCmd(['GET', rFlt(fid)]); return s ? JSON.parse(s) : null; },
+  fleetAdd: async (fid, tid) => { await redisCmd(['RPUSH', rFltM(fid), tid]); },
+  fleetMembers: async (fid) => { const a = await redisCmd(['LRANGE', rFltM(fid), '0', '-1']); return a || []; }
 };
 const store = USE_REDIS ? redisStore : fileStore;
+const fleetClients = new Map();
+function broadcastFleet(fid, obj) {
+  const set = fleetClients.get(fid); if (!set) return;
+  const msg = 'data: ' + JSON.stringify(obj) + '\n\n';
+  for (const res of set) { try { res.write(msg); } catch {} }
+}
 
 const CORS = {
   'Access-Control-Allow-Origin': '*',
@@ -195,6 +221,20 @@ const PAGE_INDEX = `<!DOCTYPE html>
       <p class="warn">Note bien le lien skipper : il porte ta clé de publication et ne peut pas être régénéré.</p>
     </div>
   </div>
+  <div class="card">
+    <label>Ou crée une flotte (course / groupe)</label>
+    <input id="fname" type="text" placeholder="Entraînement Class40" value="Flotte">
+    <button class="btn" id="createFleet">Créer la flotte</button>
+    <div class="out" id="fout">
+      <div class="k">Lien suiveurs de la flotte (à partager)</div>
+      <div class="lk" id="fLink"></div>
+      <button class="mini" id="cpF">Copier</button><button class="mini" id="opF">Ouvrir</button>
+      <div class="k">Lien d'invitation skipper (chaque bateau l'ouvre pour rejoindre)</div>
+      <div class="lk" id="jLink"></div>
+      <button class="mini" id="cpJ">Copier</button>
+      <p class="warn">Chaque skipper ouvre le lien d'invitation, entre son nom de bateau, et reçoit son propre lien d'émission privé.</p>
+    </div>
+  </div>
 </div>
 <script>
 "use strict";
@@ -213,6 +253,20 @@ document.getElementById('create').onclick=function(){
     document.getElementById('cpV').onclick=function(){cp(v);};
     document.getElementById('opV').onclick=function(){window.open(v,'_blank');};
   }).catch(function(){alert('Erreur de création');});
+};
+document.getElementById('createFleet').onclick=function(){
+  var name=document.getElementById('fname').value||'Flotte';
+  fetch('/api/fleets',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name:name})})
+  .then(function(r){return r.json();}).then(function(d){
+    var vf=location.origin+'/vf?id='+d.id;
+    var jn=location.origin+'/join?fleet='+d.id;
+    document.getElementById('fLink').textContent=vf;
+    document.getElementById('jLink').textContent=jn;
+    document.getElementById('fout').style.display='block';
+    document.getElementById('cpF').onclick=function(){cp(vf);};
+    document.getElementById('opF').onclick=function(){window.open(vf,'_blank');};
+    document.getElementById('cpJ').onclick=function(){cp(jn);};
+  }).catch(function(){alert('Erreur de création flotte');});
 };
 </script>
 </body>
@@ -880,6 +934,192 @@ function windyFillLayers(sel, def) {
   });
 }
 `;
+const PAGE_FLEET = `<!DOCTYPE html>
+<html lang="fr">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, viewport-fit=cover">
+<title>Suivi de flotte</title>
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.css">
+<link rel="stylesheet" href="https://unpkg.com/maplibre-gl/dist/maplibre-gl.css">
+<style>
+  :root{--navy:#0a1a26;--panel:rgba(10,26,38,.92);--line:#1d3a4d;--amber2:#ffc25a;--ink:#e8f1f6;--dim:#8fb0c2}
+  *{box-sizing:border-box}
+  html,body{margin:0;height:100%;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;background:var(--navy);color:var(--ink)}
+  #map{position:absolute;inset:0}
+  .bar{position:fixed;top:calc(env(safe-area-inset-top) + 8px);left:8px;z-index:1200;background:var(--panel);backdrop-filter:blur(8px);border:1px solid var(--line);border-radius:12px;padding:8px 12px;max-width:70vw}
+  .bar b{font-size:14px}
+  .bar .sub{font-size:11px;color:var(--dim)}
+  #legend{position:fixed;right:8px;bottom:calc(env(safe-area-inset-bottom) + 8px);z-index:1200;background:var(--panel);backdrop-filter:blur(8px);border:1px solid var(--line);border-radius:12px;padding:8px 10px;max-height:46vh;overflow:auto;min-width:150px;max-width:60vw}
+  .lgh{font-size:10px;text-transform:uppercase;letter-spacing:1px;color:var(--dim);margin-bottom:6px}
+  .lgi{display:flex;align-items:center;gap:7px;padding:3px 0;font-size:13px;cursor:pointer}
+  .dot{width:11px;height:11px;border-radius:50%;border:1px solid #fff;flex:0 0 auto}
+  .sp{margin-left:auto;color:var(--amber2);font-variant-numeric:tabular-nums;font-size:12px}
+  .fitbtn{position:fixed;left:8px;bottom:calc(env(safe-area-inset-bottom) + 8px);z-index:1200;background:var(--panel);backdrop-filter:blur(8px);border:1px solid var(--line);border-radius:10px;color:var(--ink);padding:9px 12px;font-size:13px;cursor:pointer}
+  .leaflet-container{background:#0a1a26}
+</style>
+</head>
+<body>
+<div id="map"></div>
+<div class="bar"><b id="flname">Flotte</b><div class="sub" id="flcount">Connexion…</div></div>
+<button class="fitbtn" id="fit">⤢ Tout voir</button>
+<div id="legend"><div class="lgh">Flotte</div></div>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.js"></script>
+<script src="https://unpkg.com/maplibre-gl/dist/maplibre-gl.js"></script>
+<script src="https://unpkg.com/@maplibre/maplibre-gl-leaflet/leaflet-maplibre-gl.js"></script>
+<script>
+"use strict";
+var fid=new URLSearchParams(location.search).get('id');
+var $=function(i){return document.getElementById(i);};
+
+var map=L.map('map',{zoomControl:true,worldCopyJump:true}).setView([47,-5],6);
+
+/* ---- fonds de carte (identiques au suivi solo) ---- */
+var esriOcean=L.tileLayer('https://server.arcgisonline.com/ArcGIS/rest/services/Ocean/World_Ocean_Base/MapServer/tile/{z}/{y}/{x}',{maxZoom:16,attribution:'Esri Ocean'});
+var esriSat=L.tileLayer('https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}',{maxZoom:18,attribution:'Esri'});
+var osm=L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png',{maxZoom:18,attribution:'&copy; OpenStreetMap'});
+var emodnet=L.tileLayer('https://tiles.emodnet-bathymetry.eu/2020/baselayer/web_mercator/{z}/{x}/{y}.png',{maxNativeZoom:11,maxZoom:18,attribution:'Bathymétrie &copy; EMODnet'});
+var seamark=L.tileLayer('https://tiles.openseamap.org/seamark/{z}/{x}/{y}.png',{maxZoom:18,opacity:.9,attribution:'&copy; OpenSeaMap'});
+var shomBalise=L.tileLayer('https://services.data.shom.fr/INSPIRE/wmts?SERVICE=WMTS&VERSION=1.0.0&REQUEST=GetTile&LAYER=BALISAGE_PYR_PNG_3857_WMTS&STYLE=normal&TILEMATRIXSET=3857&TILEMATRIX={z}&TILEROW={y}&TILECOL={x}&FORMAT=image/png',{maxNativeZoom:17,maxZoom:18,attribution:'Balisage &copy; SHOM'});
+
+var bases={};
+if(L.maplibreGL) bases['Carte marine (isobathes/sondes)']=L.maplibreGL({style:'https://tiles.openwaters.io/seascape/style.json',attribution:'Fonds &copy; openwaters.io (CC BY 4.0)'});
+bases['Océan (Esri)']=esriOcean;
+bases['Bathymétrie (EMODnet)']=emodnet;
+bases['Satellite']=esriSat;
+bases['OpenStreetMap']=osm;
+(bases['Carte marine (isobathes/sondes)']||esriOcean).addTo(map);
+seamark.addTo(map);
+L.control.layers(bases,{'Balises (OpenSeaMap)':seamark,'Balises SHOM':shomBalise},{position:'topright',collapsed:true}).addTo(map);
+
+/* ---- gestion des bateaux ---- */
+function boatColor(id){var h=0;for(var i=0;i<id.length;i++)h=(h*31+id.charCodeAt(i))>>>0;return 'hsl('+(h%360)+',85%,55%)';}
+function esc(s){return (s||'').replace(/[&<>]/g,function(c){return {'&':'&amp;','<':'&lt;','>':'&gt;'}[c];});}
+var boats={};
+function ensureBoat(id,name){
+  if(boats[id]){if(name)boats[id].name=name;return boats[id];}
+  var c=boatColor(id);
+  boats[id]={name:name||'Bateau',color:c,last:null,marker:null,trace:L.polyline([],{color:c,weight:3,opacity:.85}).addTo(map)};
+  return boats[id];
+}
+function boatAdd(id,name,p){
+  var b=ensureBoat(id,name);
+  var ll=[p[0],p[1]];
+  b.trace.addLatLng(ll);
+  if(!b.marker){
+    b.marker=L.circleMarker(ll,{radius:6,color:'#fff',weight:1.6,fillColor:b.color,fillOpacity:1}).addTo(map)
+      .bindTooltip(b.name,{direction:'top',offset:[0,-6]});
+  } else { b.marker.setLatLng(ll); }
+  b.last=p;
+  renderLegend();
+}
+function renderLegend(){
+  var el=$('legend');var ks=Object.keys(boats);
+  var html='<div class="lgh">'+ks.length+' bateau'+(ks.length>1?'x':'')+'</div>';
+  ks.sort(function(a,bk){return (boats[a].name||'').localeCompare(boats[bk].name||'');});
+  ks.forEach(function(k){var b=boats[k];var sog=(b.last&&b.last[3]!=null)?(Math.round(b.last[3]*10)/10)+' kt':'—';
+    html+='<div class="lgi" data-id="'+k+'"><span class="dot" style="background:'+b.color+'"></span><span>'+esc(b.name)+'</span><span class="sp">'+sog+'</span></div>';});
+  el.innerHTML=html;
+  var rows=el.querySelectorAll('.lgi');
+  for(var i=0;i<rows.length;i++){rows[i].onclick=function(){var b=boats[this.getAttribute('data-id')];if(b&&b.last)map.setView([b.last[0],b.last[1]],Math.max(map.getZoom(),12));};}
+}
+function fitAll(){var g=[];for(var k in boats)if(boats[k].last)g.push([boats[k].last[0],boats[k].last[1]]);if(g.length===1)map.setView(g[0],11);else if(g.length)map.fitBounds(g,{padding:[50,50],maxZoom:12});}
+$('fit').onclick=fitAll;
+
+/* ---- chargement + temps réel ---- */
+if(!fid){$('flname').textContent='Lien de flotte invalide';}
+else{
+  fetch('/api/fleets/'+fid).then(function(r){return r.json();}).then(function(d){
+    if(d.error){$('flname').textContent='Flotte introuvable';$('flcount').textContent='';return;}
+    $('flname').textContent=d.name||'Flotte';
+    (d.boats||[]).forEach(function(bo){ if(bo.last) boatAdd(bo.id,bo.name,bo.last); else ensureBoat(bo.id,bo.name); });
+    renderLegend(); fitAll(); subscribe();
+  }).catch(function(){$('flcount').textContent='Erreur de chargement';});
+}
+function subscribe(){
+  var es=new EventSource('/api/fleets/'+fid+'/stream');
+  es.onopen=function(){$('flcount').textContent='En direct';};
+  es.onerror=function(){$('flcount').textContent='Reconnexion…';};
+  es.onmessage=function(ev){ try{var m=JSON.parse(ev.data); if(m&&m.p) boatAdd(m.b,m.n,m.p);}catch(e){} };
+}
+
+/* ---- pointeur météo / courant ---- */
+function dirArrow(deg){var a=['↓','↙','←','↖','↑','↗','→','↘'];return a[Math.round(((deg||0)%360)/45)%8];}
+map.on('click',function(e){
+  var ll=e.latlng;
+  var pop=L.popup({maxWidth:230}).setLatLng(ll).setContent('Chargement…').openOn(map);
+  function dt(d){return d==null?'—':(dirArrow(d)+' '+Math.round(d)+'°');}
+  fetch('/api/point?lat='+ll.lat.toFixed(3)+'&lon='+ll.lng.toFixed(3)).then(function(r){return r.json();}).then(function(d){
+    pop.setContent('<div style="font-size:12px;line-height:1.6">'
+      +'💨 Vent : '+(d.wind!=null?Math.round(d.wind)+' kt '+dt(d.windDir):'—')+'<br>'
+      +'🔽 Pression : '+(d.pressure!=null?Math.round(d.pressure)+' hPa':'—')+'<br>'
+      +'🌊 Courant : '+(d.curSpeed!=null?d.curSpeed.toFixed(1)+' kt '+dt(d.curDir):'—')+'</div>');
+  }).catch(function(){pop.setContent('Erreur');});
+});
+</script>
+</body>
+</html>
+`;
+const PAGE_JOIN = `<!DOCTYPE html>
+<html lang="fr">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Rejoindre la flotte</title>
+<style>
+  :root{--navy:#0a1a26;--navy2:#0e2636;--panel:#0e2636;--line:#1d3a4d;--amber:#f5a623;--amber2:#ffc25a;--cyan:#39c0d3;--ink:#e8f1f6;--dim:#8fb0c2}
+  *{box-sizing:border-box}
+  body{margin:0;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;background:radial-gradient(120% 90% at 50% 0%,#12314a 0%,var(--navy) 60%);color:var(--ink);min-height:100vh;display:flex;align-items:center;justify-content:center;padding:22px}
+  .wrap{width:100%;max-width:460px;background:var(--panel);border:1px solid var(--line);border-radius:16px;padding:22px}
+  h1{margin:0 0 6px;font-size:20px}
+  p{color:var(--dim);font-size:14px;line-height:1.5}
+  input{width:100%;padding:12px 14px;border-radius:10px;border:1px solid var(--line);background:#0a1e2c;color:var(--ink);font-size:16px;margin:8px 0}
+  button{width:100%;padding:12px;border:0;border-radius:10px;background:linear-gradient(180deg,var(--amber2),var(--amber));color:#241400;font-weight:700;font-size:15px;cursor:pointer}
+  .link{display:block;word-break:break-all;background:#0a1e2c;border:1px solid var(--line);border-radius:10px;padding:10px;color:var(--cyan);font-family:ui-monospace,monospace;font-size:12px;margin:8px 0;text-decoration:none}
+  .hint{font-size:12px}
+  .err{color:#e6584c;font-size:13px;min-height:16px}
+  button.copy{background:#123147;color:var(--ink);border:1px solid var(--line);margin-top:6px}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>⛵ Rejoindre la flotte</h1>
+  <p id="sub">Entre le nom de ton bateau pour rejoindre la flotte et apparaître sur la carte commune.</p>
+  <div id="form">
+    <input id="boat" placeholder="Nom du bateau (ex. EKINOX)" maxlength="40" autocomplete="off">
+    <button id="go">Rejoindre la flotte</button>
+  </div>
+  <div id="result" style="display:none">
+    <p>C'est bon&nbsp;! Voici <b>ton</b> lien d'émission privé — garde-le pour toi&nbsp;:</p>
+    <a id="emit" class="link" target="_blank"></a>
+    <button id="copy" class="copy">Copier le lien</button>
+    <p class="hint">Ouvre ce lien sur le téléphone du bord et <b>garde la page au premier plan</b> pour émettre ta position. Tu apparaîtras automatiquement sur la carte de la flotte.</p>
+  </div>
+  <p id="err" class="err"></p>
+</div>
+<script>
+"use strict";
+var fid=new URLSearchParams(location.search).get('fleet');
+var $=function(i){return document.getElementById(i);};
+if(!fid){$('sub').textContent='Lien de flotte invalide ou manquant.';$('form').style.display='none';}
+$('go').onclick=function(){
+  var name=$('boat').value.trim();
+  if(!name){$('err').textContent='Indique un nom de bateau.';return;}
+  $('err').textContent='';$('go').disabled=true;$('go').textContent='…';
+  fetch('/api/fleets/'+fid+'/join',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name:name})})
+   .then(function(r){return r.json();}).then(function(d){
+     if(d.error){$('err').textContent=d.error;$('go').disabled=false;$('go').textContent='Rejoindre la flotte';return;}
+     var url=location.origin+'/p?id='+d.id+'&key='+d.publishKey;
+     var a=$('emit');a.textContent=url;a.href=url;
+     $('form').style.display='none';$('result').style.display='block';
+     $('copy').onclick=function(){try{navigator.clipboard.writeText(url);this.textContent='Copié ✓';}catch(e){}};
+   }).catch(function(){$('err').textContent='Erreur réseau, réessaie.';$('go').disabled=false;$('go').textContent='Rejoindre la flotte';});
+};
+</script>
+</body>
+</html>
+`;
 
 const server = http.createServer(async (req, res) => {
   const u = new URL(req.url, 'http://x');
@@ -890,7 +1130,7 @@ const server = http.createServer(async (req, res) => {
     if (p === '/api/tracks' && req.method === 'POST') {
       let body; try { body = await readBody(req); } catch { return json(res, 400, { error: 'json' }); }
       const id = id16(), publishKey = key24();
-      const meta = { id, name: (body.name || 'Navigation').toString().slice(0, 80), keyHash: sha(publishKey), createdAt: Date.now() };
+      const meta = { id, name: (body.name || 'Navigation').toString().slice(0, 80), keyHash: sha(publishKey), createdAt: Date.now(), fleets: [] };
       await store.create(meta);
       return json(res, 201, { id, publishKey, name: meta.name });
     }
@@ -919,7 +1159,7 @@ const server = http.createServer(async (req, res) => {
         norm.push([r6(lat), r6(lon), Math.round(num(q.t) || Date.now()), sog === null ? null : Math.round(sog * 10) / 10, cog === null ? null : Math.round(cog)]);
       }
       let count = 0;
-      if (norm.length) { count = await store.append(mPos[1], norm); for (const pt of norm) broadcast(mPos[1], pt); }
+      if (norm.length) { count = await store.append(mPos[1], norm); for (const pt of norm) { broadcast(mPos[1], pt); if (meta.fleets && meta.fleets.length) for (const fid of meta.fleets) broadcastFleet(fid, { b: mPos[1], n: meta.name, p: pt }); } }
       return json(res, 200, { ok: true, added: norm.length, count });
     }
     if (mStream && req.method === 'GET') {
@@ -930,6 +1170,48 @@ const server = http.createServer(async (req, res) => {
       clients.get(meta.id).add(res);
       const ping = setInterval(() => { try { res.write(': ping\n\n'); } catch {} }, 25000);
       req.on('close', () => { clearInterval(ping); const s = clients.get(meta.id); if (s) s.delete(res); });
+      return;
+    }
+
+    if (p === '/api/fleets' && req.method === 'POST') {
+      let body; try { body = await readBody(req); } catch { return json(res, 400, { error: 'json' }); }
+      const fid = id16();
+      const fm = { id: fid, name: (body.name || 'Flotte').toString().slice(0, 80), createdAt: Date.now() };
+      await store.fleetCreate(fm);
+      return json(res, 201, fm);
+    }
+    const mFleetJoin = p.match(/^\/api\/fleets\/([a-f0-9]{16})\/join$/);
+    const mFleet = p.match(/^\/api\/fleets\/([a-f0-9]{16})$/);
+    const mFleetStream = p.match(/^\/api\/fleets\/([a-f0-9]{16})\/stream$/);
+    if (mFleetJoin && req.method === 'POST') {
+      const fid = mFleetJoin[1];
+      const fleet = await store.fleetGet(fid); if (!fleet) return json(res, 404, { error: 'flotte introuvable' });
+      let body; try { body = await readBody(req); } catch { return json(res, 400, { error: 'json' }); }
+      const id = id16(), publishKey = key24();
+      const meta = { id, name: (body.name || 'Bateau').toString().slice(0, 80), keyHash: sha(publishKey), createdAt: Date.now(), fleets: [fid] };
+      await store.create(meta);
+      await store.fleetAdd(fid, id);
+      return json(res, 201, { id, publishKey, name: meta.name, fleet: fid });
+    }
+    if (mFleet && req.method === 'GET') {
+      const fleet = await store.fleetGet(mFleet[1]); if (!fleet) return json(res, 404, { error: 'flotte introuvable' });
+      const ids = await store.fleetMembers(mFleet[1]);
+      const boats = [];
+      for (const id of ids) {
+        const m = await store.getMeta(id); if (!m) continue;
+        const last = await store.lastPoint(id);
+        boats.push({ id, name: m.name, last });
+      }
+      return json(res, 200, { id: fleet.id, name: fleet.name, boats });
+    }
+    if (mFleetStream && req.method === 'GET') {
+      const fleet = await store.fleetGet(mFleetStream[1]); if (!fleet) return json(res, 404, { error: 'flotte introuvable' });
+      res.writeHead(200, Object.assign({ 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache', 'Connection': 'keep-alive', 'X-Accel-Buffering': 'no' }, CORS));
+      res.write('retry: 5000\n\n');
+      if (!fleetClients.has(fleet.id)) fleetClients.set(fleet.id, new Set());
+      fleetClients.get(fleet.id).add(res);
+      const ping = setInterval(() => { try { res.write(': ping\n\n'); } catch {} }, 25000);
+      req.on('close', () => { clearInterval(ping); const st = fleetClients.get(fleet.id); if (st) st.delete(res); });
       return;
     }
 
@@ -962,6 +1244,8 @@ const server = http.createServer(async (req, res) => {
   if (p === '/v') return serveHTML(res, PAGE_VIEWER);
   if (p === '/p') return serveHTML(res, PAGE_PUBLISHER);
   if (p === '/meteo') return serveHTML(res, PAGE_METEO);
+  if (p === '/vf') return serveHTML(res, PAGE_FLEET);
+  if (p === '/join') return serveHTML(res, PAGE_JOIN);
   res.writeHead(404, { 'Content-Type': 'text/plain' }); res.end('404');
 });
 
