@@ -256,7 +256,8 @@ var esriOcean=L.tileLayer('https://server.arcgisonline.com/ArcGIS/rest/services/
 var esriOceanRef=L.tileLayer('https://server.arcgisonline.com/ArcGIS/rest/services/Ocean/World_Ocean_Reference/MapServer/tile/{z}/{y}/{x}',{maxNativeZoom:13,maxZoom:18});
 var esriSat=L.tileLayer('https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}',{maxNativeZoom:18,maxZoom:18,attribution:'Imagerie &copy; Esri'});
 var osm=L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png',{maxZoom:18,attribution:'&copy; OpenStreetMap'});
-var shom=L.tileLayer('https://services.data.shom.fr/INSPIRE/wmts?SERVICE=WMTS&VERSION=1.0.0&REQUEST=GetTile&LAYER=RASTER_MARINE_3857_WMTS&STYLE=normal&TILEMATRIXSET=3857&TILEMATRIX={z}&TILEROW={y}&TILECOL={x}&FORMAT=image/png',{maxNativeZoom:17,maxZoom:18,attribution:'Carte marine &copy; SHOM — visualisation, pas pour la navigation'});
+var shomBathy=L.tileLayer('https://services.data.shom.fr/INSPIRE/wmts?SERVICE=WMTS&VERSION=1.0.0&REQUEST=GetTile&LAYER=BATHYELLI_ZH_PYR_PNG_3857_WMTS&STYLE=normal&TILEMATRIXSET=3857&TILEMATRIX={z}&TILEROW={y}&TILECOL={x}&FORMAT=image/png',{maxNativeZoom:15,maxZoom:18,opacity:0.85,attribution:'Bathymétrie ZH &copy; SHOM'});
+var shomBalise=L.tileLayer('https://services.data.shom.fr/INSPIRE/wmts?SERVICE=WMTS&VERSION=1.0.0&REQUEST=GetTile&LAYER=BALISAGE_PYR_PNG_3857_WMTS&STYLE=normal&TILEMATRIXSET=3857&TILEMATRIX={z}&TILEROW={y}&TILECOL={x}&FORMAT=image/png',{maxNativeZoom:17,maxZoom:18,attribution:'Balisage &copy; SHOM'});
 esriOcean.addTo(map); esriOceanRef.addTo(map);
 // libellés océan seulement sur le fond Océan
 map.on('baselayerchange',function(e){
@@ -280,8 +281,8 @@ if(owmKey){
   weather['Pluie']=owm('precipitation_new');
   weather['Température']=owm('temp_new');
 }
-var bases={'Carte marine (SHOM)':shom,'Océan (Esri)':esriOcean,'Bathymétrie (EMODnet)':emodnet,'Satellite':esriSat,'OpenStreetMap':osm};
-var overlays=Object.assign({'Balises':seamark},weather);
+var bases={'Océan (Esri)':esriOcean,'Bathymétrie (EMODnet)':emodnet,'Satellite':esriSat,'OpenStreetMap':osm};
+var overlays=Object.assign({'Balises (OpenSeaMap)':seamark,'Bathymétrie SHOM (ZH)':shomBathy,'Balises SHOM':shomBalise},weather);
 var layerCtl=L.control.layers(bases,overlays,{position:'topright',collapsed:true}).addTo(map);
 // Radar pluie RainViewer (sans clé)
 fetch('https://api.rainviewer.com/public/weather-maps.json').then(function(r){return r.json();}).then(function(d){
