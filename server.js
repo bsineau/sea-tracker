@@ -1280,16 +1280,26 @@ const server = http.createServer(async (req, res) => {
     }
 
     if (p === '/api/osmand') {
-      const q = u.searchParams;
-      const idp = q.get('id');
-      const lat = num(parseFloat(q.get('lat'))), lon = num(parseFloat(q.get('lon')));
-      if (!idp || lat === null || lon === null) { res.writeHead(400, CORS); return res.end('bad request'); }
+      const params = {};
+      u.searchParams.forEach((v, k) => { params[k] = v; });
+      if (req.method === 'POST') {
+        const raw = await new Promise((resolve) => { let b = '', n = 0; req.on('data', (c) => { n += c.length; if (n > 1e5) { req.destroy(); resolve(''); } else b += c; }); req.on('end', () => resolve(b)); req.on('error', () => resolve('')); });
+        if (raw) {
+          const ct = req.headers['content-type'] || '';
+          if (ct.indexOf('application/json') >= 0) { try { Object.assign(params, JSON.parse(raw)); } catch {} }
+          else { try { new URLSearchParams(raw).forEach((v, k) => { if (params[k] == null) params[k] = v; }); } catch {} }
+        }
+      }
+      const idp = params.id;
+      const lat = num(parseFloat(params.lat)), lon = num(parseFloat(params.lon));
+      if (!idp) { res.writeHead(400, CORS); return res.end('no id'); }
+      if (lat === null || lon === null) { res.writeHead(200, CORS); return res.end('OK'); }
       const tid = await store.devGet(sha(idp));
       if (!tid) { res.writeHead(404, CORS); return res.end('device inconnu'); }
-      let t = Date.now(); const ts = q.get('timestamp');
-      if (ts) { if (/^\d+$/.test(ts)) { const n = parseInt(ts, 10); t = n < 1e12 ? n * 1000 : n; } else { const d = Date.parse(ts.replace(' ', 'T')); if (!isNaN(d)) t = d; } }
-      const sog = num(parseFloat(q.get('speed')));
-      const cog = num(parseFloat(q.get('bearing'))) === null ? num(parseFloat(q.get('heading'))) : num(parseFloat(q.get('bearing')));
+      let t = Date.now(); const ts = params.timestamp;
+      if (ts) { const tss = String(ts); if (/^\d+$/.test(tss)) { const n = parseInt(tss, 10); t = n < 1e12 ? n * 1000 : n; } else { const d = Date.parse(tss.replace(' ', 'T')); if (!isNaN(d)) t = d; } }
+      const sog = num(parseFloat(params.speed));
+      let cog = num(parseFloat(params.bearing)); if (cog === null) cog = num(parseFloat(params.heading)); if (cog === null) cog = num(parseFloat(params.course));
       const pt = [r6(lat), r6(lon), Math.round(t), sog === null ? null : Math.round(sog * 10) / 10, cog === null ? null : Math.round(cog)];
       const meta = await store.getMeta(tid);
       await store.append(tid, [pt]);
