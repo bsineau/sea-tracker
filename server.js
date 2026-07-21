@@ -66,6 +66,28 @@ function windToVelocity(la1, lo1, la2, lo2, nx, ny, step, uArr, vArr) {
     { header: Object.assign({}, base, { parameterNumber: 3, parameterNumberName: 'V-component_of_wind', parameterUnit: 'm.s-1' }), data: vArr }
   ];
 }
+async function omGet(url) { try { const r = await fetch(url); return await r.json(); } catch { return null; } }
+async function omGrid(qlat, qlon, model, hour) {
+  const common = 'latitude=' + qlat.join(',') + '&longitude=' + qlon.join(',') + '&wind_speed_unit=ms&timezone=GMT';
+  const mp = (model && model !== 'best_match') ? '&models=' + encodeURIComponent(model) : '';
+  if (!hour) {
+    let j = await omGet('https://api.open-meteo.com/v1/forecast?' + common + '&current=wind_speed_10m,wind_direction_10m' + mp);
+    if (!j || j.error) j = await omGet('https://api.open-meteo.com/v1/forecast?' + common + '&current=wind_speed_10m,wind_direction_10m');
+    const arr = Array.isArray(j) ? j : (j ? [j] : []);
+    if (!arr.length || !arr[0].current) return null;
+    return arr.map((p) => { const c = (p && p.current) || {}; return { sp: num(c.wind_speed_10m) || 0, dr: num(c.wind_direction_10m) || 0 }; });
+  }
+  const days = Math.min(3, Math.max(1, Math.ceil((hour + 6) / 24)));
+  let j = await omGet('https://api.open-meteo.com/v1/forecast?' + common + '&hourly=wind_speed_10m,wind_direction_10m&forecast_days=' + days + mp);
+  if (!j || j.error) j = await omGet('https://api.open-meteo.com/v1/forecast?' + common + '&hourly=wind_speed_10m,wind_direction_10m&forecast_days=' + days);
+  const arr = Array.isArray(j) ? j : (j ? [j] : []);
+  if (!arr.length || !arr[0].hourly) return null;
+  const t = new Date(); t.setUTCMinutes(0, 0, 0); t.setUTCHours(t.getUTCHours() + hour);
+  const target = t.toISOString().slice(0, 13) + ':00';
+  const times = arr[0].hourly.time || [];
+  let idx = times.indexOf(target); if (idx < 0) idx = 0;
+  return arr.map((p) => { const h = (p && p.hourly) || {}; return { sp: num(h.wind_speed_10m && h.wind_speed_10m[idx]) || 0, dr: num(h.wind_direction_10m && h.wind_direction_10m[idx]) || 0 }; });
+}
 async function fetchWind(clat, clon, model, hour) {
   const STEP = 1, HALF_LAT = 6, HALF_LON = 8;
   const la1 = Math.round(clat) + HALF_LAT, la2 = Math.round(clat) - HALF_LAT;
@@ -74,27 +96,11 @@ async function fetchWind(clat, clon, model, hour) {
   const qlat = [], qlon = [];
   for (let la = la1; la >= la2; la -= STEP) for (let lo = lo1; lo <= lo2; lo += STEP) { qlat.push(la); qlon.push(lo); }
   hour = hour || 0;
-  const days = Math.min(3, Math.max(1, Math.ceil((hour + 6) / 24)));
-  const base = 'https://api.open-meteo.com/v1/forecast?latitude=' + qlat.join(',') + '&longitude=' + qlon.join(',')
-    + '&hourly=wind_speed_10m,wind_direction_10m&wind_speed_unit=ms&timezone=GMT&forecast_days=' + days;
-  const url = base + ((model && model !== 'best_match') ? '&models=' + encodeURIComponent(model) : '');
-  let j = await (await fetch(url)).json();
-  if (j && (j.error || (!Array.isArray(j) && !j.hourly))) j = await (await fetch(base)).json();
-  const arr = Array.isArray(j) ? j : [j];
-  const t = new Date(); t.setUTCMinutes(0, 0, 0); t.setUTCHours(t.getUTCHours() + hour);
-  const target = t.toISOString().slice(0, 13) + ':00';
-  let idx = 0;
-  const times = arr[0] && arr[0].hourly && arr[0].hourly.time;
-  if (times) { const p = times.indexOf(target); if (p >= 0) idx = p; }
-  const uArr = [], vArr = [];
-  for (const pt of arr) {
-    const h = pt && pt.hourly ? pt.hourly : {};
-    const sp = num(h.wind_speed_10m && h.wind_speed_10m[idx]) || 0;
-    const dr = num(h.wind_direction_10m && h.wind_direction_10m[idx]) || 0;
-    const rad = dr * Math.PI / 180;
-    uArr.push(-sp * Math.sin(rad));
-    vArr.push(-sp * Math.cos(rad));
-  }
+  let e = await omGrid(qlat, qlon, model, hour);
+  if (!e || !e.length) e = await omGrid(qlat, qlon, model, 0);
+  e = e || [];
+  const N = nx * ny, uArr = [], vArr = [];
+  for (let i = 0; i < N; i++) { const p = e[i] || { sp: 0, dr: 0 }; const rad = p.dr * Math.PI / 180; uArr.push(-p.sp * Math.sin(rad)); vArr.push(-p.sp * Math.cos(rad)); }
   return windToVelocity(la1, lo1, la2, lo2, nx, ny, STEP, uArr, vArr);
 }
 async function omForecast(clat, clon, model, vars) {
@@ -320,7 +326,7 @@ const PAGE_VIEWER = `<!DOCTYPE html>
 <title>Suivi en direct</title>
 <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.css">
 <link rel="stylesheet" href="https://unpkg.com/maplibre-gl/dist/maplibre-gl.css">
-<link rel="stylesheet" href="https://unpkg.com/leaflet-velocity/dist/leaflet-velocity.min.css">
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/leaflet-velocity@2.1.4/dist/leaflet-velocity.min.css">
 <style>
   :root{--navy:#0a1a26;--navy2:#0e2636;--panel:rgba(10,26,38,.92);--line:#1d3a4d;
     --amber:#f5a623;--amber2:#ffc25a;--cyan:#39c0d3;--ink:#e8f1f6;--dim:#8fb0c2;--green:#37c871;--red:#e6584c}
@@ -413,7 +419,7 @@ const PAGE_VIEWER = `<!DOCTYPE html>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.js"></script>
 <script src="https://unpkg.com/maplibre-gl/dist/maplibre-gl.js"></script>
 <script src="https://unpkg.com/@maplibre/maplibre-gl-leaflet/leaflet-maplibre-gl.js"></script>
-<script src="https://unpkg.com/leaflet-velocity/dist/leaflet-velocity.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/leaflet-velocity@2.1.4/dist/leaflet-velocity.min.js"></script>
 <script>
 "use strict";
 var id = new URL(location.href).searchParams.get('id');
@@ -1011,7 +1017,7 @@ const PAGE_FLEET = `<!DOCTYPE html>
 <title>Suivi de flotte</title>
 <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.css">
 <link rel="stylesheet" href="https://unpkg.com/maplibre-gl/dist/maplibre-gl.css">
-<link rel="stylesheet" href="https://unpkg.com/leaflet-velocity/dist/leaflet-velocity.min.css">
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/leaflet-velocity@2.1.4/dist/leaflet-velocity.min.css">
 <style>
   #windCtl{position:fixed;left:8px;z-index:1200;display:none;background:var(--panel);backdrop-filter:blur(8px);border:1px solid var(--line);border-radius:10px;padding:8px 10px;bottom:calc(env(safe-area-inset-bottom) + 60px)}
   #windCtl select{background:#0a1e2c;color:var(--ink);border:1px solid var(--line);border-radius:8px;padding:5px 7px;font-size:12px;margin-right:6px}
@@ -1052,7 +1058,7 @@ const PAGE_FLEET = `<!DOCTYPE html>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.js"></script>
 <script src="https://unpkg.com/maplibre-gl/dist/maplibre-gl.js"></script>
 <script src="https://unpkg.com/@maplibre/maplibre-gl-leaflet/leaflet-maplibre-gl.js"></script>
-<script src="https://unpkg.com/leaflet-velocity/dist/leaflet-velocity.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/leaflet-velocity@2.1.4/dist/leaflet-velocity.min.js"></script>
 <script src="/config.js"></script>
 <script>
 "use strict";
