@@ -1,0 +1,9 @@
+{
+  "name": "sea-tracker",
+  "version": "1.0.0",
+  "description": "Relais de position temps reel pour navigation (zero dependance).",
+  "main": "server.js",
+  "type": "commonjs",
+  "scripts": { "start": "node server.js" },
+  "engines": { "node": ">=18" }
+}
