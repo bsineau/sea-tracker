@@ -263,8 +263,8 @@ map.on('baselayerchange',function(e){
   else if(map.hasLayer(esriOceanRef)){ map.removeLayer(esriOceanRef); }
 });
 // Bathymétrie EMODnet (profondeurs) + balises
-var emodnet=L.tileLayer.wms('https://ows.emodnet-bathymetry.eu/wms',
-  {layers:'emodnet:mean_atlas_land',format:'image/png',transparent:true,opacity:0.75,attribution:'Bathymétrie &copy; EMODnet'});
+var emodnet=L.tileLayer('https://tiles.emodnet-bathymetry.eu/2020/baselayer/web_mercator/{z}/{x}/{y}.png',
+  {maxNativeZoom:11,maxZoom:18,attribution:'Bathymétrie &copy; EMODnet'});
 var seamark=L.tileLayer('https://tiles.openseamap.org/seamark/{z}/{x}/{y}.png',{maxZoom:18,opacity:.9,attribution:'Balisage &copy; OpenSeaMap'}).addTo(map);
 
 // --- calques météo superposés (sous le bateau et la trace) ---
@@ -279,8 +279,8 @@ if(owmKey){
   weather['Pluie']=owm('precipitation_new');
   weather['Température']=owm('temp_new');
 }
-var bases={'Océan (Esri)':esriOcean,'Satellite':esriSat,'OpenStreetMap':osm};
-var overlays=Object.assign({'Balises':seamark,'Bathymétrie (EMODnet)':emodnet},weather);
+var bases={'Océan (Esri)':esriOcean,'Bathymétrie (EMODnet)':emodnet,'Satellite':esriSat,'OpenStreetMap':osm};
+var overlays=Object.assign({'Balises':seamark},weather);
 var layerCtl=L.control.layers(bases,overlays,{position:'topright',collapsed:true}).addTo(map);
 // Radar pluie RainViewer (sans clé)
 fetch('https://api.rainviewer.com/public/weather-maps.json').then(function(r){return r.json();}).then(function(d){
