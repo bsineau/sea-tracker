@@ -1140,6 +1140,7 @@ const PAGE_JOIN = `<!DOCTYPE html>
   button{width:100%;padding:12px;border:0;border-radius:10px;background:linear-gradient(180deg,var(--amber2),var(--amber));color:#241400;font-weight:700;font-size:15px;cursor:pointer}
   .link{display:block;word-break:break-all;background:#0a1e2c;border:1px solid var(--line);border-radius:10px;padding:10px;color:var(--cyan);font-family:ui-monospace,monospace;font-size:12px;margin:8px 0;text-decoration:none}
   .hint{font-size:12px}
+  .lbl{font-size:10px;text-transform:uppercase;letter-spacing:1px;color:var(--dim);margin-top:12px}
   .err{color:#e6584c;font-size:13px;min-height:16px}
   button.copy{background:#123147;color:var(--ink);border:1px solid var(--line);margin-top:6px}
 </style>
@@ -1153,10 +1154,20 @@ const PAGE_JOIN = `<!DOCTYPE html>
     <button id="go">Rejoindre la flotte</button>
   </div>
   <div id="result" style="display:none">
-    <p>C'est bon&nbsp;! Voici <b>ton</b> lien d'émission privé — garde-le pour toi&nbsp;:</p>
-    <a id="emit" class="link" target="_blank"></a>
-    <button id="copy" class="copy">Copier le lien</button>
-    <p class="hint">Ouvre ce lien sur le téléphone du bord et <b>garde la page au premier plan</b> pour émettre ta position. Tu apparaîtras automatiquement sur la carte de la flotte.</p>
+    <p>C'est bon&nbsp;! Ton bateau est créé. Configure <b>Traccar Client</b> (gratuit) avec ces deux valeurs&nbsp;:</p>
+    <div class="lbl">URL du serveur</div>
+    <div id="turl" class="link"></div>
+    <button id="copyUrl" class="copy">Copier l'URL</button>
+    <div class="lbl">Identifiant de l'appareil (ta clé)</div>
+    <div id="tkey" class="link"></div>
+    <button id="copyKey" class="copy">Copier la clé</button>
+    <p class="hint">Dans Traccar : colle ces deux valeurs, mets <b>Précision : la plus élevée</b>, puis active le service. Ton bateau émet en arrière-plan, sans page ouverte, et apparaît sur la carte de la flotte.</p>
+    <details style="margin-top:12px">
+      <summary class="hint" style="cursor:pointer;color:var(--cyan)">Ou émettre depuis le navigateur (sans Traccar)</summary>
+      <a id="emit" class="link" target="_blank" style="margin-top:8px"></a>
+      <button id="copy" class="copy">Copier le lien</button>
+      <p class="hint">Ouvre ce lien sur le tel du bord et <b>garde la page au premier plan</b>.</p>
+    </details>
   </div>
   <p id="err" class="err"></p>
 </div>
@@ -1173,9 +1184,13 @@ $('go').onclick=function(){
    .then(function(r){return r.json();}).then(function(d){
      if(d.error){$('err').textContent=d.error;$('go').disabled=false;$('go').textContent='Rejoindre la flotte';return;}
      var url=location.origin+'/p?id='+d.id+'&key='+d.publishKey;
+     var osmand=location.origin+'/api/osmand';
+     $('turl').textContent=osmand;
+     $('tkey').textContent=d.publishKey;
      var a=$('emit');a.textContent=url;a.href=url;
      $('form').style.display='none';$('result').style.display='block';
-     $('copy').onclick=function(){try{navigator.clipboard.writeText(url);this.textContent='Copié ✓';}catch(e){}};
+     function cp(btn,txt){btn.onclick=function(){try{navigator.clipboard.writeText(txt);this.textContent='Copié ✓';}catch(e){}};}
+     cp($('copyUrl'),osmand);cp($('copyKey'),d.publishKey);cp($('copy'),url);
    }).catch(function(){$('err').textContent='Erreur réseau, réessaie.';$('go').disabled=false;$('go').textContent='Rejoindre la flotte';});
 };
 </script>
@@ -1212,6 +1227,7 @@ const server = http.createServer(async (req, res) => {
     if (mPos && req.method === 'POST') {
       const meta = await store.getMeta(mPos[1]); if (!meta) return json(res, 404, { error: 'introuvable' });
       if (sha(req.headers['x-publish-key'] || '') !== meta.keyHash) return json(res, 401, { error: 'clé invalide' });
+      await store.devSet(meta.keyHash, mPos[1]);
       let body; try { body = await readBody(req); } catch { return json(res, 400, { error: 'json' }); }
       const raw = Array.isArray(body.points) ? body.points : [body];
       const norm = [];
