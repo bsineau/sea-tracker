@@ -74,6 +74,22 @@ async function fetchForecast(clat, clon, model) {
   if (d && d.error) d = await omForecast(clat, clon, model, 'wind_speed_10m,wind_direction_10m,pressure_msl,cloud_cover');
   return d;
 }
+async function fetchPoint(lat, lon) {
+  const wUrl = 'https://api.open-meteo.com/v1/forecast?latitude=' + lat + '&longitude=' + lon + '&current=wind_speed_10m,wind_direction_10m,pressure_msl&wind_speed_unit=kn&timezone=auto';
+  const mUrl = 'https://marine-api.open-meteo.com/v1/marine?latitude=' + lat + '&longitude=' + lon + '&current=ocean_current_velocity,ocean_current_direction&timezone=auto';
+  const [w, m] = await Promise.all([
+    fetch(wUrl).then(r => r.json()).catch(() => ({})),
+    fetch(mUrl).then(r => r.json()).catch(() => ({}))
+  ]);
+  const wc = (w && w.current) || {}, mc = (m && m.current) || {};
+  const cv = num(mc.ocean_current_velocity);
+  const cu = m && m.current_units ? m.current_units.ocean_current_velocity : 'km/h';
+  const curKt = cv === null ? null : (cu === 'm/s' ? cv * 1.94384 : (cu === 'kn' || cu === 'kt' ? cv : cv / 1.852));
+  return {
+    wind: num(wc.wind_speed_10m), windDir: num(wc.wind_direction_10m), pressure: num(wc.pressure_msl),
+    curSpeed: curKt === null ? null : Math.round(curKt * 10) / 10, curDir: num(mc.ocean_current_direction)
+  };
+}
 
 /* ---- back-end fichiers ---- */
 const fileCache = new Map();
@@ -423,6 +439,21 @@ function loadForecast(){
 document.getElementById('fcBtn').onclick=function(){document.getElementById('fcSheet').style.display='block';loadForecast();};
 document.getElementById('fcClose').onclick=function(){document.getElementById('fcSheet').style.display='none';};
 document.getElementById('fcModel').onchange=loadForecast;
+
+// Pointeur : clic sur la carte -> bulle vent / pression / courant
+map.on('click', function(e){
+  var ll=e.latlng;
+  var pop=L.popup({maxWidth:230}).setLatLng(ll).setContent('Chargement…').openOn(map);
+  function dtxt(deg){return deg==null?'—':(dirArrow(deg)+' '+Math.round(deg)+'°');}
+  fetch('/api/point?lat='+ll.lat.toFixed(3)+'&lon='+ll.lng.toFixed(3)).then(function(r){return r.json();}).then(function(d){
+    pop.setContent('<div style="font-size:12px;line-height:1.6">'
+      +'<b>'+fmtCoord(ll.lat,ll.lng)+'</b><br>'
+      +'💨 Vent : '+(d.wind!=null?Math.round(d.wind)+' kt '+dtxt(d.windDir):'—')+'<br>'
+      +'🔽 Pression : '+(d.pressure!=null?Math.round(d.pressure)+' hPa':'—')+'<br>'
+      +'🌊 Courant : '+(d.curSpeed!=null?d.curSpeed.toFixed(1)+' kt '+dtxt(d.curDir):'—')
+      +'</div>');
+  }).catch(function(){pop.setContent('Erreur de chargement');});
+});
 // Radar pluie RainViewer (sans clé)
 fetch('https://api.rainviewer.com/public/weather-maps.json').then(function(r){return r.json();}).then(function(d){
   if(d&&d.radar&&d.radar.past&&d.radar.past.length){
@@ -916,6 +947,12 @@ const server = http.createServer(async (req, res) => {
       const model = u.searchParams.get('model') || '';
       const fc = await fetchForecast(clat === null ? 47 : clat, clon === null ? -4 : clon, model);
       return json(res, 200, fc);
+    }
+    if (p === '/api/point' && req.method === 'GET') {
+      const clat = num(parseFloat(u.searchParams.get('lat')));
+      const clon = num(parseFloat(u.searchParams.get('lon')));
+      const pt = await fetchPoint(clat === null ? 47 : clat, clon === null ? -4 : clon);
+      return json(res, 200, pt);
     }
   } catch (e) { return json(res, 500, { error: 'stockage indisponible' }); }
 
