@@ -1042,6 +1042,13 @@ function updateBoatStyle(b){
   if(b.trace)b.trace.setStyle({opacity:on?0.85:0.25});
   var tt=b.marker.getTooltip&&b.marker.getTooltip();if(tt&&tt.setOpacity)tt.setOpacity(on?1:0.5);
 }
+var onlineOnly=false;
+function applyVisibility(){
+  for(var k in boats){var b=boats[k];var vis=!onlineOnly||isOnline(b);
+    if(b.marker){if(vis){if(!map.hasLayer(b.marker))b.marker.addTo(map);}else if(map.hasLayer(b.marker))map.removeLayer(b.marker);}
+    if(b.trace){if(vis){if(!map.hasLayer(b.trace))b.trace.addTo(map);}else if(map.hasLayer(b.trace))map.removeLayer(b.trace);}
+  }
+}
 function ensureBoat(id,name){
   if(boats[id]){if(name)boats[id].name=name;return boats[id];}
   var c=boatColor(id);
@@ -1059,22 +1066,25 @@ function boatAdd(id,name,p){
   } else { b.marker.setLatLng(ll); b.marker.setTooltipContent(b.name); }
   b.last=p;
   updateBoatStyle(b);
+  applyVisibility();
   renderLegend();
 }
 function applyNames(){for(var k in boats){var b=boats[k];if(b.marker){if(showNames)b.marker.openTooltip();else b.marker.closeTooltip();}}}
 function renderLegend(){
-  var el=$('legend');var ks=Object.keys(boats);
-  var html='<div class="lgh">'+ks.length+' bateau'+(ks.length>1?'x':'')+' · <label><input type="checkbox" id="nameToggle"'+(showNames?' checked':'')+'> Noms</label></div>';
+  var el=$('legend');
+  var ks=Object.keys(boats).filter(function(k){return !onlineOnly||isOnline(boats[k]);});
+  var html='<div class="lgh">'+ks.length+' bateau'+(ks.length>1?'x':'')+' · <label><input type="checkbox" id="nameToggle"'+(showNames?' checked':'')+'> Noms</label> · <label><input type="checkbox" id="onlineToggle"'+(onlineOnly?' checked':'')+'> En ligne</label></div>';
   ks.sort(function(a,bk){return (boats[a].name||'').localeCompare(boats[bk].name||'');});
   ks.forEach(function(k){var b=boats[k];var on=isOnline(b);
     var right=on?((b.last&&b.last[3]!=null)?(Math.round(b.last[3]*10)/10)+' kt':'—'):(b.last?'vu '+fmtAge(b.last[2]):'—');
     html+='<div class="lgi'+(on?'':' off')+'" data-id="'+k+'"><span class="dot" style="background:'+(on?b.color:'#6b7f8c')+'"></span><span>'+esc(b.name)+'</span><span class="sp'+(on?'':' offsp')+'">'+right+'</span></div>';});
   el.innerHTML=html;
   var ntg=$('nameToggle');if(ntg)ntg.onchange=function(){showNames=this.checked;applyNames();};
+  var otg=$('onlineToggle');if(otg)otg.onchange=function(){onlineOnly=this.checked;applyVisibility();renderLegend();};
   var rows=el.querySelectorAll('.lgi');
   for(var i=0;i<rows.length;i++){rows[i].onclick=function(){var b=boats[this.getAttribute('data-id')];if(b&&b.last)map.setView([b.last[0],b.last[1]],Math.max(map.getZoom(),12));};}
 }
-function refreshStatus(){for(var k in boats)updateBoatStyle(boats[k]);renderLegend();}
+function refreshStatus(){for(var k in boats)updateBoatStyle(boats[k]);applyVisibility();renderLegend();}
 setInterval(refreshStatus,30000);
 function fitAll(){var g=[];for(var k in boats)if(boats[k].last)g.push([boats[k].last[0],boats[k].last[1]]);if(g.length===1)map.setView(g[0],11);else if(g.length)map.fitBounds(g,{padding:[50,50],maxZoom:12});}
 $('fit').onclick=fitAll;
