@@ -250,9 +250,21 @@ function gcInterp(a,b,f){var d=angDist(a,b);if(d<1e-9)return{lat:a.lat,lon:a.lon
   var z=A*Math.sin(p1)+B*Math.sin(p2);
   return{lat:Math.atan2(z,Math.sqrt(x*x+y*y))*R2D,lon:Math.atan2(y,x)*R2D};}
 
-var map=L.map('map',{zoomControl:true,worldCopyJump:true}).setView([46,-20],4);
-var esriOcean=L.tileLayer('https://server.arcgisonline.com/ArcGIS/rest/services/Ocean/World_Ocean_Base/MapServer/tile/{z}/{y}/{x}',{maxZoom:13,attribution:'Fond océan &copy; Esri'}).addTo(map);
-L.tileLayer('https://server.arcgisonline.com/ArcGIS/rest/services/Ocean/World_Ocean_Reference/MapServer/tile/{z}/{y}/{x}',{maxZoom:13}).addTo(map);
+var map=L.map('map',{zoomControl:true,worldCopyJump:true,maxZoom:18}).setView([46,-20],4);
+// Fonds de carte
+var esriOcean=L.tileLayer('https://server.arcgisonline.com/ArcGIS/rest/services/Ocean/World_Ocean_Base/MapServer/tile/{z}/{y}/{x}',{maxNativeZoom:13,maxZoom:18,attribution:'Fond océan &copy; Esri'});
+var esriOceanRef=L.tileLayer('https://server.arcgisonline.com/ArcGIS/rest/services/Ocean/World_Ocean_Reference/MapServer/tile/{z}/{y}/{x}',{maxNativeZoom:13,maxZoom:18});
+var esriSat=L.tileLayer('https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}',{maxNativeZoom:18,maxZoom:18,attribution:'Imagerie &copy; Esri'});
+var osm=L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png',{maxZoom:18,attribution:'&copy; OpenStreetMap'});
+esriOcean.addTo(map); esriOceanRef.addTo(map);
+// libellés océan seulement sur le fond Océan
+map.on('baselayerchange',function(e){
+  if(e.layer===esriOcean){ if(!map.hasLayer(esriOceanRef)) esriOceanRef.addTo(map); }
+  else if(map.hasLayer(esriOceanRef)){ map.removeLayer(esriOceanRef); }
+});
+// Bathymétrie EMODnet (profondeurs) + balises
+var emodnet=L.tileLayer.wms('https://ows.emodnet-bathymetry.eu/wms',
+  {layers:'emodnet:mean_atlas_land',format:'image/png',transparent:true,opacity:0.75,attribution:'Bathymétrie &copy; EMODnet'});
 var seamark=L.tileLayer('https://tiles.openseamap.org/seamark/{z}/{x}/{y}.png',{maxZoom:18,opacity:.9,attribution:'Balisage &copy; OpenSeaMap'}).addTo(map);
 
 // --- calques météo superposés (sous le bateau et la trace) ---
@@ -267,8 +279,9 @@ if(owmKey){
   weather['Pluie']=owm('precipitation_new');
   weather['Température']=owm('temp_new');
 }
-var layerCtl=L.control.layers({'Océan':esriOcean},Object.assign({'Balises':seamark},weather),
-  {position:'topright',collapsed:true}).addTo(map);
+var bases={'Océan (Esri)':esriOcean,'Satellite':esriSat,'OpenStreetMap':osm};
+var overlays=Object.assign({'Balises':seamark,'Bathymétrie (EMODnet)':emodnet},weather);
+var layerCtl=L.control.layers(bases,overlays,{position:'topright',collapsed:true}).addTo(map);
 // Radar pluie RainViewer (sans clé)
 fetch('https://api.rainviewer.com/public/weather-maps.json').then(function(r){return r.json();}).then(function(d){
   if(d&&d.radar&&d.radar.past&&d.radar.past.length){
