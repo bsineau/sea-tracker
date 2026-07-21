@@ -436,6 +436,7 @@ function gcInterp(a,b,f){var d=angDist(a,b);if(d<1e-9)return{lat:a.lat,lon:a.lon
   return{lat:Math.atan2(z,Math.sqrt(x*x+y*y))*R2D,lon:Math.atan2(y,x)*R2D};}
 
 var map=L.map('map',{zoomControl:true,worldCopyJump:true,maxZoom:18}).setView([46,-20],4);
+map.createPane('windPane');map.getPane('windPane').style.zIndex=550;map.getPane('windPane').style.pointerEvents='none';
 // Fonds de carte
 var esriOcean=L.tileLayer('https://server.arcgisonline.com/ArcGIS/rest/services/Ocean/World_Ocean_Base/MapServer/tile/{z}/{y}/{x}',{maxNativeZoom:13,maxZoom:18,attribution:'Fond océan &copy; Esri'});
 var esriOceanRef=L.tileLayer('https://server.arcgisonline.com/ArcGIS/rest/services/Ocean/World_Ocean_Reference/MapServer/tile/{z}/{y}/{x}',{maxNativeZoom:13,maxZoom:18});
@@ -486,7 +487,7 @@ var windLayer=null, windBusy=false;
 function windOpts(d){return {displayValues:true,
   displayOptions:{velocityType:'Vent',position:'bottomleft',emptyString:'—',angleConvention:'bearingCW',speedUnit:'kt'},
   data:d, minVelocity:0, maxVelocity:18, velocityScale:0.014, opacity:1,
-  lineWidth:2.4, particleAge:110, particleMultiplier:1/170,
+  lineWidth:2.4, particleAge:110, particleMultiplier:1/170, paneName:'windPane',
   colorScale:['#3a4cff','#0091ff','#00c2ff','#00e0a0','#61ff3d','#d4ff00','#ffd000','#ff8a00','#ff3b2f','#ff0a78']};}
 function loadWind(){
   if(!L.velocityLayer)return; windBusy=true;
@@ -1059,6 +1060,7 @@ var fid=new URLSearchParams(location.search).get('id');
 var $=function(i){return document.getElementById(i);};
 
 var map=L.map('map',{zoomControl:true,worldCopyJump:true}).setView([47,-5],6);
+map.createPane('windPane');map.getPane('windPane').style.zIndex=550;map.getPane('windPane').style.pointerEvents='none';
 
 /* ---- fonds de carte (identiques au suivi solo) ---- */
 var esriOcean=L.tileLayer('https://server.arcgisonline.com/ArcGIS/rest/services/Ocean/World_Ocean_Base/MapServer/tile/{z}/{y}/{x}',{maxZoom:16,attribution:'Esri Ocean'});
@@ -1090,7 +1092,7 @@ var HOURS=[{v:0,t:'Maintenant'},{v:6,t:'+6 h'},{v:12,t:'+12 h'},{v:24,t:'+24 h'}
 function fillSel(sel,list,def){list.forEach(function(o){var e=document.createElement('option');e.value=o.v;e.textContent=o.t;if(String(o.v)===String(def))e.selected=true;sel.appendChild(e);});}
 fillSel($('windModel'),MODELS,'best_match');fillSel($('windHour'),HOURS,0);
 var windLayer=null,windBusy=false;
-function windOpts(d){return {displayValues:true,displayOptions:{velocityType:'Vent',position:'bottomleft',emptyString:'—',angleConvention:'bearingCW',speedUnit:'kt'},data:d,minVelocity:0,maxVelocity:18,velocityScale:0.014,opacity:1,lineWidth:2.4,particleAge:110,particleMultiplier:1/170,colorScale:['#3a4cff','#0091ff','#00c2ff','#00e0a0','#61ff3d','#d4ff00','#ffd000','#ff8a00','#ff3b2f','#ff0a78']};}
+function windOpts(d){return {displayValues:true,displayOptions:{velocityType:'Vent',position:'bottomleft',emptyString:'—',angleConvention:'bearingCW',speedUnit:'kt'},data:d,minVelocity:0,maxVelocity:18,velocityScale:0.014,opacity:1,lineWidth:2.4,particleAge:110,paneName:'windPane',particleMultiplier:1/170,colorScale:['#3a4cff','#0091ff','#00c2ff','#00e0a0','#61ff3d','#d4ff00','#ffd000','#ff8a00','#ff3b2f','#ff0a78']};}
 function loadWind(){if(!L.velocityLayer)return;windBusy=true;var c=map.getCenter();var model=$('windModel').value,hour=$('windHour').value;fetch('/api/wind?lat='+c.lat.toFixed(2)+'&lon='+c.lng.toFixed(2)+'&model='+encodeURIComponent(model)+'&hour='+hour).then(function(r){return r.json();}).then(function(d){windBusy=false;if(windLayer){windGroup.removeLayer(windLayer);windLayer=null;}windLayer=L.velocityLayer(windOpts(d));windGroup.addLayer(windLayer);}).catch(function(){windBusy=false;});}
 map.on('overlayadd',function(e){if(e.layer!==windGroup)return;$('windCtl').style.display='block';if(!windLayer&&!windBusy)loadWind();});
 map.on('overlayremove',function(e){if(e.layer!==windGroup)return;$('windCtl').style.display='none';if(windLayer){windGroup.removeLayer(windLayer);windLayer=null;}});
