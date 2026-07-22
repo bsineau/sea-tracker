@@ -1105,7 +1105,7 @@ const PAGE_FLEET = `<!DOCTYPE html>
 </head>
 <body>
 <div id="map"></div>
-<div class="bar"><b id="flname">Flotte</b><div class="sub" id="flcount">Connexion…</div>
+<div class="bar"><a href="/admin" id="back" style="display:none;color:#39c0d3;text-decoration:none;font-size:12px;font-weight:600">‹ Console</a><b id="flname">Flotte</b><div class="sub" id="flcount">Connexion…</div>
   <select id="flswitch" style="display:none;margin-top:7px;width:100%;background:#0a1e2c;color:var(--ink);border:1px solid var(--line);border-radius:8px;padding:6px 7px;font-size:12px"></select>
 </div>
 <button class="fitbtn" id="fit">⤢ Tout voir</button>
@@ -1121,10 +1121,12 @@ const PAGE_FLEET = `<!DOCTYPE html>
 "use strict";
 var fid=new URLSearchParams(location.search).get('id');
 var ADMK=new URLSearchParams(location.search).get('k')||'';
+try{ if(!ADMK) ADMK=localStorage.getItem('st_key')||''; }catch(e){}
 var $=function(i){return document.getElementById(i);};
 
 /* ---- bascule entre flottes (console) ---- */
 if(ADMK){
+  var bk=$('back'); if(bk)bk.style.display='block';
   fetch('/api/admin/fleets',{headers:{'x-admin-key':ADMK}}).then(function(r){return r.ok?r.json():null;}).then(function(d){
     if(!d||!d.fleets||d.fleets.length<1)return;
     var sel=$('flswitch');
@@ -1134,8 +1136,8 @@ if(ADMK){
       +'<option value="__admin">⚓️ Console des flottes</option>';
     sel.style.display='block';
     sel.onchange=function(){
-      if(this.value==='__admin'){location.href='/admin?k='+encodeURIComponent(ADMK);return;}
-      if(this.value&&this.value!==fid)location.href='/vf?id='+this.value+'&k='+encodeURIComponent(ADMK);
+      if(this.value==='__admin'){location.href='/admin';return;}
+      if(this.value&&this.value!==fid)location.href='/vf?id='+this.value;
     };
   }).catch(function(){});
 }
@@ -1494,12 +1496,18 @@ const PAGE_ADMIN = `<!DOCTYPE html>
       <p class="msg" id="adoptMsg"></p>
     </details>
   </div>
+  <div style="text-align:center;margin:4px 0 26px">
+    <a href="#" id="logout" style="color:#8fb0c2;font-size:13px;text-decoration:none">Oublier la clé sur cet appareil</a>
+  </div>
 </div>
 
 <script>
 "use strict";
 var $=function(i){return document.getElementById(i);};
 var K=new URLSearchParams(location.search).get('k')||'';
+try{ if(!K) K=localStorage.getItem('st_key')||''; }catch(e){}
+function saveKey(k){ try{ localStorage.setItem('st_key',k); }catch(e){} }
+function forgetKey(){ try{ localStorage.removeItem('st_key'); }catch(e){} }
 var ORIGIN=location.origin;
 var AIS=false;
 
@@ -1516,7 +1524,7 @@ function age(ms){var s=Math.floor((Date.now()-ms)/1000);if(s<60)return "à l'ins
 $('auth').onclick=function(){
   var v=$('key').value.trim();
   if(!v){say($('authMsg'),'Saisis la clé.','err');return;}
-  location.search='?k='+encodeURIComponent(v);
+  K=v; saveKey(v); $('authCard').style.display='none'; boot();
 };
 $('key').addEventListener('keydown',function(e){if(e.key==='Enter')$('auth').click();});
 
@@ -1524,11 +1532,14 @@ function boot(){
   if(!K){$('authCard').style.display='block';return;}
   api('/api/admin/fleets').then(function(r){
     if(r.code!==200){
+      forgetKey();
       $('authCard').style.display='block';
       say($('authMsg'),(r.body&&r.body.error)||'Accès refusé','err');
       return;
     }
     AIS=!!r.body.aisEnabled;
+    saveKey(K);
+    try{ if(location.search.indexOf('k=')>=0) history.replaceState(null,'','/admin'); }catch(e){}
     $('app').style.display='block';
     render(r.body.fleets);
   }).catch(function(){$('authCard').style.display='block';say($('authMsg'),'Erreur réseau','err');});
@@ -1543,7 +1554,7 @@ function render(fleets){
   if(!fleets.length){el.innerHTML='<div class="card"><div class="empty">Aucune flotte pour l\\u2019instant.<br>Crée la première ci-dessus.</div></div>';return;}
   var h='';
   fleets.forEach(function(f){
-    var vf=ORIGIN+'/vf?id='+f.id+'&k='+encodeURIComponent(K);
+    var vf=ORIGIN+'/vf?id='+f.id;
     var jn=ORIGIN+'/join?fleet='+f.id;
     h+='<div class="card" data-f="'+f.id+'">'
       +'<div class="fname">'+esc(f.name)+'</div>'
@@ -1576,7 +1587,7 @@ function render(fleets){
 }
 
 function wire(fleets){
-  document.querySelectorAll('[data-go]').forEach(function(b){b.onclick=function(){location.href=ORIGIN+'/vf?id='+this.getAttribute('data-go')+'&k='+encodeURIComponent(K);};});
+  document.querySelectorAll('[data-go]').forEach(function(b){b.onclick=function(){location.href=ORIGIN+'/vf?id='+this.getAttribute('data-go');};});
   document.querySelectorAll('[data-inv]').forEach(function(b){b.onclick=function(){cp(ORIGIN+'/join?fleet='+this.getAttribute('data-inv'),this);};});
   document.querySelectorAll('[data-cpv]').forEach(function(b){b.onclick=function(){cp(this.getAttribute('data-cpv'),this);};});
   document.querySelectorAll('[data-exp]').forEach(function(b){b.onclick=function(){window.open(this.getAttribute('data-exp'),'_blank');};});
@@ -1668,6 +1679,9 @@ $('adopt').onclick=function(){
     $('adoptId').value='';reload();
   });
 };
+
+var lo=$('logout');
+if(lo)lo.onclick=function(e){e.preventDefault();if(!confirm('Oublier la clé sur cet appareil ?'))return;forgetKey();location.href='/admin';};
 
 boot();
 </script>
