@@ -152,7 +152,7 @@ const fileStore = {
   points: async (id) => { const t = fileLoad(id); return t ? t.points : []; },
   lastPoint: async (id) => { const t = fileLoad(id); return t && t.points.length ? t.points[t.points.length - 1] : null; },
   fleetCreate: async (m) => { const f = Object.assign({ members: [] }, m); fleetCache.set(m.id, f); fs.writeFileSync(fltPath(m.id), JSON.stringify(f)); },
-  fleetGet: async (fid) => { const f = fleetLoad(fid); return f ? { id: f.id, name: f.name, createdAt: f.createdAt } : null; },
+  fleetGet: async (fid) => { const f = fleetLoad(fid); return f ? { id: f.id, name: f.name, createdAt: f.createdAt, aisIntervalMin: f.aisIntervalMin } : null; },
   fleetAdd: async (fid, tid) => { const f = fleetLoad(fid); if (!f) return; if (f.members.indexOf(tid) < 0) { f.members.push(tid); fs.writeFileSync(fltPath(fid), JSON.stringify(f)); } },
   fleetMembers: async (fid) => { const f = fleetLoad(fid); return f ? f.members : []; },
   fleetRemove: async (fid, tid) => { const f = fleetLoad(fid); if (!f) return; f.members = f.members.filter((x) => x !== tid); fs.writeFileSync(fltPath(fid), JSON.stringify(f)); },
@@ -161,8 +161,10 @@ const fileStore = {
   mmsiAll: async () => { try { return JSON.parse(fs.readFileSync(path.join(DATA, 'mmsi.json'), 'utf8')); } catch { return {}; } },
   mmsiSet: async (mmsi, tid) => { let d = {}; try { d = JSON.parse(fs.readFileSync(path.join(DATA, 'mmsi.json'), 'utf8')); } catch {} d[mmsi] = tid; fs.writeFileSync(path.join(DATA, 'mmsi.json'), JSON.stringify(d)); },
   mmsiDel: async (mmsi) => { let d = {}; try { d = JSON.parse(fs.readFileSync(path.join(DATA, 'mmsi.json'), 'utf8')); } catch {} delete d[mmsi]; fs.writeFileSync(path.join(DATA, 'mmsi.json'), JSON.stringify(d)); },
-  cfgGet: async () => { try { return JSON.parse(fs.readFileSync(path.join(DATA, 'settings.json'), 'utf8')); } catch { return {}; } },
-  cfgSet: async (o) => { let d = {}; try { d = JSON.parse(fs.readFileSync(path.join(DATA, 'settings.json'), 'utf8')); } catch {} Object.assign(d, o); fs.writeFileSync(path.join(DATA, 'settings.json'), JSON.stringify(d)); }
+  fleetUpdate: async (fid, patch) => { const f = fleetLoad(fid); if (!f) return null; Object.assign(f, patch); fs.writeFileSync(fltPath(fid), JSON.stringify(f)); return f; },
+  fleetIndex: async () => { try { return JSON.parse(fs.readFileSync(path.join(DATA, 'fleets.json'), 'utf8')); } catch { return []; } },
+  fleetIndexAdd: async (fid) => { let a = []; try { a = JSON.parse(fs.readFileSync(path.join(DATA, 'fleets.json'), 'utf8')); } catch {} if (a.indexOf(fid) < 0) { a.push(fid); fs.writeFileSync(path.join(DATA, 'fleets.json'), JSON.stringify(a)); } },
+  fleetDelete: async (fid) => { let a = []; try { a = JSON.parse(fs.readFileSync(path.join(DATA, 'fleets.json'), 'utf8')); } catch {} fs.writeFileSync(path.join(DATA, 'fleets.json'), JSON.stringify(a.filter((x) => x !== fid))); fleetCache.delete(fid); try { fs.unlinkSync(fltPath(fid)); } catch {} }
 };
 
 /* ---- back-end Upstash Redis (REST) ---- */
@@ -197,8 +199,10 @@ const redisStore = {
   mmsiAll: async () => { const a = await redisCmd(['HGETALL', 'mmsi']); const o = {}; if (Array.isArray(a)) { for (let i = 0; i < a.length; i += 2) o[a[i]] = a[i + 1]; } else if (a && typeof a === 'object') { Object.assign(o, a); } return o; },
   mmsiSet: async (mmsi, tid) => { await redisCmd(['HSET', 'mmsi', mmsi, tid]); },
   mmsiDel: async (mmsi) => { await redisCmd(['HDEL', 'mmsi', mmsi]); },
-  cfgGet: async () => { const v = await redisCmd(['GET', 'cfg']); try { return v ? JSON.parse(v) : {}; } catch { return {}; } },
-  cfgSet: async (o) => { const v = await redisCmd(['GET', 'cfg']); let d = {}; try { d = v ? JSON.parse(v) : {}; } catch {} Object.assign(d, o); await redisCmd(['SET', 'cfg', JSON.stringify(d)]); }
+  fleetUpdate: async (fid, patch) => { const v = await redisCmd(['GET', rFlt(fid)]); if (!v) return null; let f = {}; try { f = JSON.parse(v); } catch {} Object.assign(f, patch); await redisCmd(['SET', rFlt(fid), JSON.stringify(f)]); return f; },
+  fleetIndex: async () => { const a = await redisCmd(['SMEMBERS', 'flts']); return Array.isArray(a) ? a : []; },
+  fleetIndexAdd: async (fid) => { await redisCmd(['SADD', 'flts', fid]); },
+  fleetDelete: async (fid) => { await redisCmd(['SREM', 'flts', fid]); await redisCmd(['DEL', rFlt(fid)]); await redisCmd(['DEL', rFltM(fid)]); }
 };
 const store = USE_REDIS ? redisStore : fileStore;
 const fleetClients = new Map();
@@ -1060,7 +1064,9 @@ const PAGE_FLEET = `<!DOCTYPE html>
 </head>
 <body>
 <div id="map"></div>
-<div class="bar"><b id="flname">Flotte</b><div class="sub" id="flcount">Connexion…</div></div>
+<div class="bar"><b id="flname">Flotte</b><div class="sub" id="flcount">Connexion…</div>
+  <select id="flswitch" style="display:none;margin-top:7px;width:100%;background:#0a1e2c;color:var(--ink);border:1px solid var(--line);border-radius:8px;padding:6px 7px;font-size:12px"></select>
+</div>
 <button class="fitbtn" id="fit">⤢ Tout voir</button>
 <div id="legend"><div class="lgh">Flotte</div></div>
 <div id="windCtl"><div class="t">Vent — modèle (précision) &amp; échéance</div><select id="windModel"></select><select id="windHour"></select></div>
@@ -1073,7 +1079,25 @@ const PAGE_FLEET = `<!DOCTYPE html>
 <script>
 "use strict";
 var fid=new URLSearchParams(location.search).get('id');
+var ADMK=new URLSearchParams(location.search).get('k')||'';
 var $=function(i){return document.getElementById(i);};
+
+/* ---- bascule entre flottes (console) ---- */
+if(ADMK){
+  fetch('/api/admin/fleets',{headers:{'x-admin-key':ADMK}}).then(function(r){return r.ok?r.json():null;}).then(function(d){
+    if(!d||!d.fleets||d.fleets.length<1)return;
+    var sel=$('flswitch');
+    sel.innerHTML='<option value="">↔ Changer de flotte…</option>'
+      +d.fleets.map(function(f){return '<option value="'+f.id+'"'+(f.id===fid?' selected':'')+'>'+
+        String(f.name).replace(/[&<>"]/g,'')+' ('+f.boats+')</option>';}).join('')
+      +'<option value="__admin">⚓️ Console des flottes</option>';
+    sel.style.display='block';
+    sel.onchange=function(){
+      if(this.value==='__admin'){location.href='/admin?k='+encodeURIComponent(ADMK);return;}
+      if(this.value&&this.value!==fid)location.href='/vf?id='+this.value+'&k='+encodeURIComponent(ADMK);
+    };
+  }).catch(function(){});
+}
 
 var map=L.map('map',{zoomControl:true,worldCopyJump:true}).setView([47,-5],6);
 map.createPane('windPane');map.getPane('windPane').style.zIndex=550;map.getPane('windPane').style.pointerEvents='none';
@@ -1281,7 +1305,7 @@ const PAGE_JOIN = `<!DOCTYPE html>
       <option value="15">15 minutes</option>
       <option value="30">30 minutes</option>
     </select>
-    <p id="aisIntMsg" class="hint">Vaut pour tous les bateaux suivis par AIS. Plus l'intervalle est court, plus la trace est fine — et plus le quota de stockage est consommé.</p>
+    <p id="aisIntMsg" class="hint">Vaut pour les bateaux AIS de cette flotte. Plus l'intervalle est court, plus la trace est fine — et plus le quota de stockage est consommé.</p>
     <p class="hint">Portée : réseau de stations côtières. Un AIS classe B (2 W) porte 8–10 milles — parfait près des côtes, inopérant au large.</p>
   </div>
 </div>
@@ -1303,13 +1327,13 @@ $('aisGo').onclick=function(){
      $('aisName').value='';$('aisMmsi').value='';
    }).catch(function(){$('aisGo').disabled=false;$('aisMsg').style.color='#e6584c';$('aisMsg').textContent='Erreur réseau, réessaie.';});
 };
-fetch('/api/settings').then(function(r){return r.json();}).then(function(d){
+fetch('/api/fleets/'+fid+'/settings').then(function(r){return r.json();}).then(function(d){
   if(d&&d.aisIntervalMin)$('aisInt').value=String(d.aisIntervalMin);
 }).catch(function(){});
 $('aisInt').onchange=function(){
   var v=this.value;
   $('aisIntMsg').style.color='';$('aisIntMsg').textContent='Enregistrement…';
-  fetch('/api/settings',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({aisIntervalMin:parseInt(v,10)})})
+  fetch('/api/fleets/'+fid+'/settings',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({aisIntervalMin:parseInt(v,10)})})
    .then(function(r){return r.json();}).then(function(d){
      if(d.error){$('aisIntMsg').style.color='#e6584c';$('aisIntMsg').textContent=d.error;return;}
      $('aisIntMsg').style.color='#37c871';$('aisIntMsg').textContent='Réglé sur 1 point toutes les '+d.aisIntervalMin+' min.';
@@ -1332,6 +1356,262 @@ $('go').onclick=function(){
      cp($('copyUrl'),osmand);cp($('copyKey'),d.publishKey);cp($('copy'),url);
    }).catch(function(){$('err').textContent='Erreur réseau, réessaie.';$('go').disabled=false;$('go').textContent='Rejoindre la flotte';});
 };
+</script>
+</body>
+</html>
+`;
+const PAGE_ADMIN = `<!DOCTYPE html>
+<html lang="fr">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Console — Sea Tracker</title>
+<style>
+  :root{--navy:#0a1a26;--navy2:#0e2636;--line:#1d3a4d;
+    --amber:#f5a623;--amber2:#ffc25a;--cyan:#39c0d3;--ink:#e8f1f6;--dim:#8fb0c2;--green:#37c871;--red:#e6584c}
+  *{box-sizing:border-box;-webkit-tap-highlight-color:transparent}
+  body{margin:0;background:var(--navy);color:var(--ink);
+    font:15px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;
+    padding:env(safe-area-inset-top) 14px calc(env(safe-area-inset-bottom) + 30px)}
+  h1{font-size:20px;margin:18px 0 4px}
+  .sub{color:var(--dim);font-size:13px;margin:0 0 16px}
+  .card{background:var(--navy2);border:1px solid var(--line);border-radius:14px;padding:14px;margin-bottom:14px}
+  .lbl{font-size:10px;text-transform:uppercase;letter-spacing:1px;color:var(--dim);margin-bottom:5px}
+  input,select,textarea{width:100%;background:#0a1e2c;color:var(--ink);border:1px solid var(--line);
+    border-radius:10px;padding:11px;font-size:15px;font-family:inherit}
+  textarea{min-height:74px;resize:vertical}
+  button{background:var(--amber);color:#0a1a26;border:0;border-radius:10px;padding:11px 14px;
+    font-size:15px;font-weight:700;cursor:pointer;margin-top:9px;width:100%}
+  button.sec{background:transparent;color:var(--ink);border:1px solid var(--line);font-weight:600}
+  button.danger{background:transparent;color:var(--red);border:1px solid #46242a;font-weight:600}
+  .row{display:flex;gap:8px}
+  .row button{flex:1}
+  .fname{font-weight:700;font-size:16px}
+  .meta{color:var(--dim);font-size:12px;margin-top:2px}
+  .link{display:block;background:#0a1e2c;border:1px solid var(--line);border-radius:9px;
+    padding:9px;font:12px ui-monospace,SFMono-Regular,Menlo,monospace;color:var(--cyan);
+    word-break:break-all;margin-top:6px;text-decoration:none}
+  details{margin-top:10px;border-top:1px solid var(--line);padding-top:10px}
+  summary{cursor:pointer;color:var(--cyan);font-size:13px;font-weight:600}
+  .boat{display:flex;align-items:center;gap:8px;padding:7px 0;border-top:1px solid #12303f;font-size:14px}
+  .boat:first-of-type{border-top:0}
+  .dot{width:9px;height:9px;border-radius:50%;flex:0 0 auto}
+  .bn{flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .bs{color:var(--dim);font-size:12px;font-variant-numeric:tabular-nums}
+  .x{color:#5f7482;cursor:pointer;padding:0 4px}
+  .msg{font-size:13px;margin-top:8px;min-height:18px}
+  .err{color:var(--red)}
+  .ok{color:var(--green)}
+  .empty{color:var(--dim);font-size:14px;text-align:center;padding:18px 0}
+</style>
+</head>
+<body>
+
+<h1>⚓️ Console des flottes</h1>
+<p class="sub" id="sub">Créer, suivre et gérer toutes tes flottes.</p>
+
+<div class="card" id="authCard" style="display:none">
+  <div class="lbl">Clé de la console</div>
+  <input id="key" type="password" placeholder="ADMIN_KEY" autocomplete="off">
+  <button id="auth">Ouvrir la console</button>
+  <p class="msg err" id="authMsg"></p>
+</div>
+
+<div id="app" style="display:none">
+  <div class="card">
+    <div class="lbl">Créer une ou plusieurs flottes</div>
+    <textarea id="names" placeholder="Un nom par ligne (ou séparés par des virgules)&#10;Entraînement mardi&#10;Régate du Golfe&#10;Sélective Class40"></textarea>
+    <button id="create">Créer</button>
+    <p class="msg" id="createMsg"></p>
+  </div>
+
+  <div id="list"></div>
+
+  <div class="card">
+    <details>
+      <summary>Récupérer une flotte existante</summary>
+      <p class="sub" style="margin:8px 0">Une flotte créée avant la console n'apparaît pas dans la liste. Colle son identifiant (les 16 caractères après <code>id=</code> dans son lien) pour la rattacher.</p>
+      <input id="adoptId" placeholder="ex. 9c8634ab2c78a9fa" autocomplete="off">
+      <button class="sec" id="adopt">Rattacher</button>
+      <p class="msg" id="adoptMsg"></p>
+    </details>
+  </div>
+</div>
+
+<script>
+"use strict";
+var $=function(i){return document.getElementById(i);};
+var K=new URLSearchParams(location.search).get('k')||'';
+var ORIGIN=location.origin;
+var AIS=false;
+
+function api(path,opts){
+  opts=opts||{};
+  opts.headers=Object.assign({'Content-Type':'application/json','x-admin-key':K},opts.headers||{});
+  return fetch(path,opts).then(function(r){return r.json().then(function(j){return {code:r.status,body:j};});});
+}
+function esc(s){return String(s==null?'':s).replace(/[&<>"]/g,function(c){return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c];});}
+function say(el,txt,cls){el.className='msg '+(cls||'');el.textContent=txt;}
+function cp(txt,btn){try{navigator.clipboard.writeText(txt);var o=btn.textContent;btn.textContent='Copié ✓';setTimeout(function(){btn.textContent=o;},1400);}catch(e){}}
+function age(ms){var s=Math.floor((Date.now()-ms)/1000);if(s<60)return "à l'instant";if(s<3600)return 'il y a '+Math.floor(s/60)+' min';if(s<86400)return 'il y a '+Math.floor(s/3600)+' h';return 'il y a '+Math.floor(s/86400)+' j';}
+
+$('auth').onclick=function(){
+  var v=$('key').value.trim();
+  if(!v){say($('authMsg'),'Saisis la clé.','err');return;}
+  location.search='?k='+encodeURIComponent(v);
+};
+$('key').addEventListener('keydown',function(e){if(e.key==='Enter')$('auth').click();});
+
+function boot(){
+  if(!K){$('authCard').style.display='block';return;}
+  api('/api/admin/fleets').then(function(r){
+    if(r.code!==200){
+      $('authCard').style.display='block';
+      say($('authMsg'),(r.body&&r.body.error)||'Accès refusé','err');
+      return;
+    }
+    AIS=!!r.body.aisEnabled;
+    $('app').style.display='block';
+    render(r.body.fleets);
+  }).catch(function(){$('authCard').style.display='block';say($('authMsg'),'Erreur réseau','err');});
+}
+
+function reload(){
+  api('/api/admin/fleets').then(function(r){if(r.code===200){AIS=!!r.body.aisEnabled;render(r.body.fleets);}});
+}
+
+function render(fleets){
+  var el=$('list');
+  if(!fleets.length){el.innerHTML='<div class="card"><div class="empty">Aucune flotte pour l\\u2019instant.<br>Crée la première ci-dessus.</div></div>';return;}
+  var h='';
+  fleets.forEach(function(f){
+    var vf=ORIGIN+'/vf?id='+f.id+'&k='+encodeURIComponent(K);
+    var jn=ORIGIN+'/join?fleet='+f.id;
+    h+='<div class="card" data-f="'+f.id+'">'
+      +'<div class="fname">'+esc(f.name)+'</div>'
+      +'<div class="meta">'+f.boats+' bateau'+(f.boats>1?'x':'')+' · créée '+age(f.createdAt||Date.now())+'</div>'
+      +'<div class="row"><button data-go="'+f.id+'">Suivre</button>'
+      +'<button class="sec" data-inv="'+f.id+'">Copier l\\u2019invitation</button></div>'
+      +'<details data-det="'+f.id+'">'
+      +'<summary>Gérer cette flotte</summary>'
+      +'<div class="lbl" style="margin-top:10px">Lien de suivi (public)</div>'
+      +'<a class="link" href="'+ORIGIN+'/vf?id='+f.id+'" target="_blank">'+ORIGIN+'/vf?id='+f.id+'</a>'
+      +'<button class="sec" data-cpv="'+ORIGIN+'/vf?id='+f.id+'">Copier le lien de suivi</button>'
+      +'<div class="lbl" style="margin-top:12px">Lien d\\u2019invitation skipper</div>'
+      +'<a class="link" href="'+jn+'" target="_blank">'+jn+'</a>'
+      +'<div class="lbl" style="margin-top:12px">Renommer</div>'
+      +'<input data-nm="'+f.id+'" value="'+esc(f.name)+'" maxlength="80">'
+      +'<button class="sec" data-ren="'+f.id+'">Enregistrer le nom</button>'
+      +(AIS?('<div class="lbl" style="margin-top:12px">AIS — un point tous les</div>'
+      +'<select data-int="'+f.id+'">'+[1,2,5,10,15,30].map(function(v){return '<option value="'+v+'"'+(v===f.aisIntervalMin?' selected':'')+'>'+v+' min</option>';}).join('')+'</select>'):'')
+      +'<div class="lbl" style="margin-top:12px">Traces</div>'
+      +'<div class="row"><button class="sec" data-exp="'+ORIGIN+'/api/fleets/'+f.id+'/export?format=gpx">GPX</button>'
+      +'<button class="sec" data-exp="'+ORIGIN+'/api/fleets/'+f.id+'/export?format=csv">CSV</button></div>'
+      +'<div class="lbl" style="margin-top:12px">Bateaux</div>'
+      +'<div data-boats="'+f.id+'"><div class="empty">Chargement…</div></div>'
+      +'<button class="danger" data-del="'+f.id+'" style="margin-top:14px">Supprimer la flotte</button>'
+      +'<p class="msg" data-msg="'+f.id+'"></p>'
+      +'</details></div>';
+  });
+  el.innerHTML=h;
+  wire(fleets);
+}
+
+function wire(fleets){
+  document.querySelectorAll('[data-go]').forEach(function(b){b.onclick=function(){location.href=ORIGIN+'/vf?id='+this.getAttribute('data-go')+'&k='+encodeURIComponent(K);};});
+  document.querySelectorAll('[data-inv]').forEach(function(b){b.onclick=function(){cp(ORIGIN+'/join?fleet='+this.getAttribute('data-inv'),this);};});
+  document.querySelectorAll('[data-cpv]').forEach(function(b){b.onclick=function(){cp(this.getAttribute('data-cpv'),this);};});
+  document.querySelectorAll('[data-exp]').forEach(function(b){b.onclick=function(){window.open(this.getAttribute('data-exp'),'_blank');};});
+  document.querySelectorAll('[data-det]').forEach(function(d){d.addEventListener('toggle',function(){if(this.open)loadBoats(this.getAttribute('data-det'));});});
+  document.querySelectorAll('[data-ren]').forEach(function(b){b.onclick=function(){
+    var fid=this.getAttribute('data-ren'), nm=document.querySelector('[data-nm="'+fid+'"]').value.trim();
+    var m=document.querySelector('[data-msg="'+fid+'"]');
+    api('/api/admin/fleets/'+fid,{method:'POST',body:JSON.stringify({name:nm})}).then(function(r){
+      if(r.code!==200){say(m,r.body.error||'Erreur','err');return;}
+      say(m,'Nom enregistré.','ok');reload();
+    });
+  };});
+  document.querySelectorAll('[data-int]').forEach(function(sel){sel.onchange=function(){
+    var fid=this.getAttribute('data-int'), v=parseInt(this.value,10);
+    var m=document.querySelector('[data-msg="'+fid+'"]');
+    fetch('/api/fleets/'+fid+'/settings',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({aisIntervalMin:v})})
+      .then(function(r){return r.json();}).then(function(d){
+        if(d.error){say(m,d.error,'err');return;}
+        say(m,'AIS : un point toutes les '+d.aisIntervalMin+' min.','ok');
+      });
+  };});
+  document.querySelectorAll('[data-del]').forEach(function(b){b.onclick=function(){
+    var fid=this.getAttribute('data-del');
+    var f=fleets.filter(function(x){return x.id===fid;})[0];
+    if(!confirm('Supprimer la flotte « '+((f&&f.name)||fid)+' » ?\\n\\nLes traces des bateaux sont conservées, mais la flotte et ses liens ne fonctionneront plus.'))return;
+    api('/api/admin/fleets/'+fid,{method:'DELETE'}).then(function(){reload();});
+  };});
+}
+
+function loadBoats(fid){
+  var box=document.querySelector('[data-boats="'+fid+'"]');
+  fetch('/api/fleets/'+fid).then(function(r){return r.json();}).then(function(d){
+    var b=(d&&d.boats)||[];
+    if(!b.length){box.innerHTML='<div class="empty">Aucun bateau. Partage le lien d\\u2019invitation'+(AIS?' ou ajoute un MMSI ci-dessous':'')+'.</div>';}
+    else{
+      box.innerHTML=b.map(function(x){
+        var on=x.last&&(Date.now()-x.last[2])<900000;
+        var st=x.last?(on?((x.last[3]!=null?(Math.round(x.last[3]*10)/10)+' kt':'en ligne')):('vu '+age(x.last[2]))):'jamais vu';
+        return '<div class="boat"><span class="dot" style="background:'+(on?'#37c871':'#6b7f8c')+'"></span>'
+          +'<span class="bn">'+esc(x.name)+'</span><span class="bs">'+st+'</span>'
+          +'<span class="x" data-rm="'+fid+'|'+x.id+'|'+esc(x.name)+'">✕</span></div>';
+      }).join('');
+    }
+    if(AIS){
+      box.innerHTML+='<div class="lbl" style="margin-top:12px">Ajouter un bateau par AIS</div>'
+        +'<input data-mn="'+fid+'" placeholder="Nom du bateau" maxlength="40">'
+        +'<input data-mm="'+fid+'" placeholder="MMSI (9 chiffres)" inputmode="numeric" maxlength="9" style="margin-top:6px">'
+        +'<button class="sec" data-madd="'+fid+'">Ajouter par MMSI</button>';
+    }
+    box.querySelectorAll('[data-rm]').forEach(function(s){s.onclick=function(){
+      var parts=this.getAttribute('data-rm').split('|');
+      if(!confirm('Retirer '+parts[2]+' de la flotte ?'))return;
+      fetch('/api/fleets/'+parts[0]+'/remove',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({trackId:parts[1]})})
+        .then(function(){loadBoats(parts[0]);reload();});
+    };});
+    var add=box.querySelector('[data-madd]');
+    if(add)add.onclick=function(){
+      var nm=box.querySelector('[data-mn="'+fid+'"]').value.trim();
+      var mm=box.querySelector('[data-mm="'+fid+'"]').value.replace(/[^0-9]/g,'');
+      var m=document.querySelector('[data-msg="'+fid+'"]');
+      if(mm.length!==9){say(m,'Le MMSI doit comporter 9 chiffres.','err');return;}
+      fetch('/api/fleets/'+fid+'/mmsi',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name:nm,mmsi:mm})})
+        .then(function(r){return r.json();}).then(function(d){
+          if(d.error){say(m,d.error,'err');return;}
+          say(m,d.already?'Déjà suivi — rattaché à cette flotte.':'Ajouté. Il apparaîtra dès qu\\u2019une station AIS le captera.','ok');
+          loadBoats(fid);reload();
+        });
+    };
+  }).catch(function(){box.innerHTML='<div class="empty">Erreur de chargement.</div>';});
+}
+
+$('create').onclick=function(){
+  var raw=$('names').value.trim();
+  if(!raw){say($('createMsg'),'Indique au moins un nom.','err');return;}
+  say($('createMsg'),'…','');
+  api('/api/admin/fleets',{method:'POST',body:JSON.stringify({name:raw})}).then(function(r){
+    if(r.code!==201){say($('createMsg'),(r.body&&r.body.error)||'Erreur','err');return;}
+    say($('createMsg'),r.body.created.length+' flotte'+(r.body.created.length>1?'s créées':' créée')+'.','ok');
+    $('names').value='';reload();
+  });
+};
+
+$('adopt').onclick=function(){
+  var v=$('adoptId').value.trim();
+  say($('adoptMsg'),'…','');
+  api('/api/admin/adopt',{method:'POST',body:JSON.stringify({id:v})}).then(function(r){
+    if(r.code!==200){say($('adoptMsg'),(r.body&&r.body.error)||'Erreur','err');return;}
+    say($('adoptMsg'),'« '+r.body.name+' » rattachée.','ok');
+    $('adoptId').value='';reload();
+  });
+};
+
+boot();
 </script>
 </body>
 </html>
@@ -1396,7 +1676,70 @@ const server = http.createServer(async (req, res) => {
       const fid = id16();
       const fm = { id: fid, name: (body.name || 'Flotte').toString().slice(0, 80), createdAt: Date.now() };
       await store.fleetCreate(fm);
+      await store.fleetIndexAdd(fm.id);
       return json(res, 201, fm);
+    }
+    if (p.indexOf('/api/admin/') === 0) {
+      if (!ADMIN_KEY) return json(res, 503, { error: 'Console non configuree : ajoute la variable ADMIN_KEY sur le serveur.' });
+      const k = req.headers['x-admin-key'] || u.searchParams.get('k') || '';
+      if (k !== ADMIN_KEY) return json(res, 401, { error: 'Cle console invalide' });
+
+      if (p === '/api/admin/fleets' && req.method === 'GET') {
+        const ids = await store.fleetIndex();
+        const out = [];
+        for (const fid of ids) {
+          const f = await store.fleetGet(fid); if (!f) continue;
+          let n = 0; try { n = (await store.fleetMembers(fid)).length; } catch {}
+          const mn = num(f.aisIntervalMin);
+          out.push({ id: fid, name: f.name, createdAt: f.createdAt, boats: n, aisIntervalMin: (mn !== null && mn >= 1 && mn <= 60) ? mn : AIS_DEFAULT_MIN });
+        }
+        out.sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0));
+        return json(res, 200, { fleets: out, aisEnabled: !!AIS_KEY });
+      }
+
+      if (p === '/api/admin/fleets' && req.method === 'POST') {
+        let body; try { body = await readBody(req); } catch { return json(res, 400, { error: 'json' }); }
+        let names = [];
+        if (Array.isArray(body.names)) names = body.names;
+        else if (body.name) names = String(body.name).split(/[,\n]/);
+        names = names.map((x) => String(x).trim().slice(0, 80)).filter(Boolean);
+        if (!names.length) return json(res, 400, { error: 'Indique au moins un nom de flotte' });
+        if (names.length > 20) return json(res, 400, { error: 'Maximum 20 flottes a la fois' });
+        const created = [];
+        for (const nm of names) {
+          const fid = id16();
+          const fm2 = { id: fid, name: nm, createdAt: Date.now() };
+          await store.fleetCreate(fm2);
+          await store.fleetIndexAdd(fid);
+          created.push({ id: fid, name: nm });
+        }
+        return json(res, 201, { created });
+      }
+
+      if (p === '/api/admin/adopt' && req.method === 'POST') {
+        let body; try { body = await readBody(req); } catch { return json(res, 400, { error: 'json' }); }
+        const fid = String(body.id || '').trim().toLowerCase();
+        if (!/^[a-f0-9]{16}$/.test(fid)) return json(res, 400, { error: 'Identifiant de flotte invalide' });
+        const f = await store.fleetGet(fid); if (!f) return json(res, 404, { error: 'Aucune flotte avec cet identifiant' });
+        await store.fleetIndexAdd(fid);
+        return json(res, 200, { id: fid, name: f.name });
+      }
+
+      const mAdmF = p.match(/^\/api\/admin\/fleets\/([a-f0-9]{16})$/);
+      if (mAdmF && req.method === 'POST') {
+        let body; try { body = await readBody(req); } catch { return json(res, 400, { error: 'json' }); }
+        const nm = String(body.name || '').trim().slice(0, 80);
+        if (!nm) return json(res, 400, { error: 'Nom vide' });
+        const f = await store.fleetUpdate(mAdmF[1], { name: nm });
+        if (!f) return json(res, 404, { error: 'flotte introuvable' });
+        return json(res, 200, { id: mAdmF[1], name: nm });
+      }
+      if (mAdmF && req.method === 'DELETE') {
+        await store.fleetDelete(mAdmF[1]);
+        await aisRefresh(false);
+        return json(res, 200, { ok: true });
+      }
+      return json(res, 404, { error: 'route console inconnue' });
     }
     const mFleetRemove = p.match(/^\/api\/fleets\/([a-f0-9]{16})\/remove$/);
     if (mFleetRemove && req.method === 'POST') {
@@ -1406,16 +1749,22 @@ const server = http.createServer(async (req, res) => {
       await store.fleetRemove(mFleetRemove[1], tid);
       return json(res, 200, { ok: true });
     }
-    if (p === '/api/settings' && req.method === 'GET') {
-      return json(res, 200, { aisIntervalMin: Math.round(aisIntervalMs / 60000), aisEnabled: !!AIS_KEY, aisDefaultMin: AIS_DEFAULT_MIN });
-    }
-    if (p === '/api/settings' && req.method === 'POST') {
-      let body; try { body = await readBody(req); } catch { return json(res, 400, { error: 'json' }); }
-      const m = num(parseInt(body.aisIntervalMin, 10));
-      if (m === null || m < 1 || m > 60) return json(res, 400, { error: 'Intervalle attendu entre 1 et 60 minutes' });
-      aisIntervalMs = m * 60000;
-      await store.cfgSet({ aisIntervalMin: m });
-      return json(res, 200, { aisIntervalMin: m });
+    const mFleetSet = p.match(/^\/api\/fleets\/([a-f0-9]{16})\/settings$/);
+    if (mFleetSet) {
+      const fid = mFleetSet[1];
+      const fleet = await store.fleetGet(fid); if (!fleet) return json(res, 404, { error: 'flotte introuvable' });
+      if (req.method === 'GET') {
+        const mn = num(fleet.aisIntervalMin);
+        return json(res, 200, { aisIntervalMin: (mn !== null && mn >= 1 && mn <= 60) ? mn : AIS_DEFAULT_MIN, aisEnabled: !!AIS_KEY, aisDefaultMin: AIS_DEFAULT_MIN });
+      }
+      if (req.method === 'POST') {
+        let body; try { body = await readBody(req); } catch { return json(res, 400, { error: 'json' }); }
+        const mn = num(parseInt(body.aisIntervalMin, 10));
+        if (mn === null || mn < 1 || mn > 60) return json(res, 400, { error: 'Intervalle attendu entre 1 et 60 minutes' });
+        await store.fleetUpdate(fid, { aisIntervalMin: mn });
+        await aisRefresh(false);
+        return json(res, 200, { aisIntervalMin: mn });
+      }
     }
     const mFleetMmsi = p.match(/^\/api\/fleets\/([a-f0-9]{16})\/mmsi$/);
     if (mFleetMmsi && req.method === 'POST') {
@@ -1552,13 +1901,15 @@ const server = http.createServer(async (req, res) => {
   if (p === '/meteo') return serveHTML(res, PAGE_METEO);
   if (p === '/vf') return serveHTML(res, PAGE_FLEET);
   if (p === '/join') return serveHTML(res, PAGE_JOIN);
+  if (p === '/admin') return serveHTML(res, PAGE_ADMIN);
   res.writeHead(404, { 'Content-Type': 'text/plain' }); res.end('404');
 });
 
 /* ---- Ingestion AIS (aisstream.io) : bateaux suivis par MMSI ---- */
 const AIS_KEY = process.env.AIS_API_KEY || '';
+const ADMIN_KEY = process.env.ADMIN_KEY || '';
 const AIS_DEFAULT_MIN = 5;
-let aisIntervalMs = AIS_DEFAULT_MIN * 60000;
+const aisInfo = new Map();
 let aisMap = {};
 const aisLast = new Map();
 let aisWs = null, aisRetry = 0, aisTimer = null;
@@ -1569,10 +1920,11 @@ async function aisHandle(raw) {
   const md = m.MetaData || {};
   const pr = (m.Message && m.Message.PositionReport) || {};
   const mmsi = String(md.MMSI || pr.UserID || '');
-  const tid = aisMap[mmsi];
-  if (!tid) return;
+  const info = aisInfo.get(mmsi);
+  if (!info) return;
+  const tid = info.tid;
   const now = Date.now();
-  if (now - (aisLast.get(mmsi) || 0) < aisIntervalMs) return;
+  if (now - (aisLast.get(mmsi) || 0) < info.ms) return;
   const lat = num(pr.Latitude != null ? pr.Latitude : md.latitude);
   const lon = num(pr.Longitude != null ? pr.Longitude : md.longitude);
   if (lat === null || lon === null || Math.abs(lat) > 90 || Math.abs(lon) > 180) return;
@@ -1582,10 +1934,9 @@ async function aisHandle(raw) {
   const sog = num(pr.Sog), cog = num(pr.Cog);
   const pt = [r6(lat), r6(lon), Math.round(t), (sog === null || sog >= 102.3) ? null : Math.round(sog * 10) / 10, (cog === null || cog >= 360) ? null : Math.round(cog)];
   try {
-    const meta = await store.getMeta(tid);
     await store.append(tid, [pt]);
     broadcast(tid, pt);
-    if (meta && meta.fleets) for (const fid of meta.fleets) broadcastFleet(fid, { b: tid, n: meta.name, p: pt });
+    for (const fid of info.fleets) broadcastFleet(fid, { b: tid, n: info.name, p: pt });
   } catch {}
 }
 function aisReconnect() {
@@ -1615,10 +1966,26 @@ function aisConnect() {
 }
 async function aisRefresh(reconnect) {
   try { aisMap = (await store.mmsiAll()) || {}; } catch { aisMap = {}; }
+  aisInfo.clear();
+  const fcache = new Map();
+  for (const mmsi of Object.keys(aisMap)) {
+    const tid = aisMap[mmsi];
+    let meta = null; try { meta = await store.getMeta(tid); } catch {}
+    const fids = (meta && meta.fleets) || [];
+    let best = null;
+    for (const fid of fids) {
+      let v = fcache.get(fid);
+      if (v === undefined) {
+        let f = null; try { f = await store.fleetGet(fid); } catch {}
+        const mn = num(f && f.aisIntervalMin);
+        v = (mn !== null && mn >= 1 && mn <= 60) ? mn : AIS_DEFAULT_MIN;
+        fcache.set(fid, v);
+      }
+      if (best === null || v < best) best = v;
+    }
+    aisInfo.set(mmsi, { tid: tid, name: (meta && meta.name) || ('MMSI ' + mmsi), fleets: fids, ms: (best === null ? AIS_DEFAULT_MIN : best) * 60000 });
+  }
   if (reconnect) aisConnect();
 }
-async function aisLoadCfg() {
-  try { const c = await store.cfgGet(); const m = num(c && c.aisIntervalMin); if (m !== null && m >= 1 && m <= 60) aisIntervalMs = Math.round(m) * 60000; } catch {}
-}
 
-server.listen(PORT, () => { console.log('Sea Tracker (' + (USE_REDIS ? 'Upstash Redis' : 'fichiers') + ') sur http://localhost:' + PORT); aisLoadCfg().then(() => { if (AIS_KEY) aisRefresh(true); }); });
+server.listen(PORT, () => { console.log('Sea Tracker (' + (USE_REDIS ? 'Upstash Redis' : 'fichiers') + ') sur http://localhost:' + PORT); if (AIS_KEY) aisRefresh(true); });
