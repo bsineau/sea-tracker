@@ -89,7 +89,10 @@ function xlsxLines(buf) {
 }
 /* prefixes reserves : 970 SART, 972 homme a la mer, 974 balise de detresse, 99x aides a la navigation */
 const mmsiEcarte = (v) => /^(97[0245]|99)/.test(v);
-function parseMmsiLignes(lignes) {
+function champsLigne(ligne) {
+  return String(ligne).replace(/\u00a0/g, ' ').split(/\s*[|;,\t]\s*/).map((x) => x.trim()).filter(Boolean);
+}
+function parseMmsiLignes(lignes, colonne) {
   const items = [];
   for (const brut of lignes) {
     const ligne = String(brut).replace(/\u00a0/g, ' ').trim();
@@ -98,8 +101,10 @@ function parseMmsiLignes(lignes) {
     if (!nums.length) continue;
     const mmsi = nums.find((v) => !mmsiEcarte(v)) || nums[0];
     let nom = '';
-    const champs = ligne.split(/\s*[|;,\t]\s*/).map((x) => x.trim()).filter(Boolean);
-    if (champs.length > 1) {
+    const champs = champsLigne(ligne);
+    if (colonne !== null && colonne !== undefined && champs[colonne]) {
+      nom = champs[colonne];
+    } else if (champs.length > 1) {
       for (const c of champs) {
         if (/^\d+$/.test(c)) continue;                              // nombres seuls
         if ((c.match(/[A-Za-z\u00c0-\u00ff]/g) || []).length < 2) continue; // trop peu de lettres
@@ -1258,7 +1263,10 @@ const PAGE_FLEET = `<!DOCTYPE html>
   .bar{position:fixed;top:calc(env(safe-area-inset-top) + 8px);left:8px;z-index:1200;background:var(--panel);backdrop-filter:blur(8px);border:1px solid var(--line);border-radius:12px;padding:8px 12px;max-width:70vw}
   .bar b{font-size:14px}
   .bar .sub{font-size:11px;color:var(--dim)}
-  #legend{position:fixed;right:8px;bottom:calc(env(safe-area-inset-bottom) + 8px);z-index:1200;background:var(--panel);backdrop-filter:blur(8px);border:1px solid var(--line);border-radius:12px;padding:8px 10px;max-height:46vh;overflow:auto;min-width:150px;max-width:60vw}
+  #legend .lgi span:nth-child(2){flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  #legend .lgi{display:flex;align-items:center;gap:7px}
+  #legend .sp{flex:0 0 auto;white-space:nowrap;font-size:11px}
+  #legend{position:fixed;right:8px;bottom:calc(env(safe-area-inset-bottom) + 8px);z-index:1200;background:var(--panel);backdrop-filter:blur(8px);border:1px solid var(--line);border-radius:12px;padding:8px 10px;max-height:46vh;overflow:auto;min-width:190px;max-width:68vw}
   .lgh{font-size:10px;text-transform:uppercase;letter-spacing:1px;color:var(--dim);margin-bottom:6px}
   .lgi{display:flex;align-items:center;gap:7px;padding:3px 0;font-size:13px;cursor:pointer}
   .dot{width:11px;height:11px;border-radius:50%;border:1px solid #fff;flex:0 0 auto}
@@ -1286,7 +1294,7 @@ const PAGE_FLEET = `<!DOCTYPE html>
   .leaflet-control-attribution.exp{white-space:normal;max-width:94vw}
   .leaflet-control-attribution a{color:#39c0d3}
 
-  .leaflet-tooltip.boat-name{background:rgba(10,26,38,.82);border:0;color:#fff;font-weight:700;font-size:11px;padding:1px 6px;border-radius:6px;box-shadow:none;white-space:nowrap}
+  .leaflet-tooltip.boat-name{background:rgba(10,26,38,.78);border:0;color:#fff;font-weight:600;font-size:9.5px;padding:0 5px;border-radius:5px;box-shadow:none;white-space:nowrap;max-width:110px;overflow:hidden;text-overflow:ellipsis}
   .leaflet-tooltip.boat-name:before{display:none}
   .lgh label{text-transform:none;letter-spacing:0;cursor:pointer}
   .lgh input{vertical-align:-1px}
@@ -1469,6 +1477,8 @@ function boatColor(id){var h=0;for(var i=0;i<id.length;i++)h=(h*31+id.charCodeAt
 function esc(s){return (s||'').replace(/[&<>]/g,function(c){return {'&':'&amp;','<':'&lt;','>':'&gt;'}[c];});}
 var boats={};
 var showNames=true;
+var legOpen=true;
+function courtNom(n){n=String(n||'');return n.length>15?n.slice(0,14)+'…':n;}
 var OFFLINE_MS=15*60*1000; // seuil hors-ligne (15 min) — réglable
 function isOnline(b){return !!(b.last && (Date.now()-b.last[2])<=OFFLINE_MS);}
 function fmtAge(ms){var s=Math.max(0,Math.floor((Date.now()-ms)/1000));if(s<60)return 'à l\\u2019instant';if(s<3600)return 'il y a '+Math.floor(s/60)+' min';return 'il y a '+Math.floor(s/3600)+' h';}
@@ -1516,9 +1526,9 @@ function boatAdd(id,name,p){
   b.trace.addLatLng(ll);
   if(!b.marker){
     b.marker=L.circleMarker(ll,{radius:6,color:'#fff',weight:1.6,fillColor:b.color,fillOpacity:1}).addTo(map)
-      .bindTooltip(b.name,{permanent:true,direction:'right',offset:[9,0],className:'boat-name'});
+      .bindTooltip(courtNom(b.name),{permanent:true,direction:'right',offset:[9,0],className:'boat-name'});
     if(!showNames) b.marker.closeTooltip();
-  } else { b.marker.setLatLng(ll); b.marker.setTooltipContent(b.name); }
+  } else { b.marker.setLatLng(ll); b.marker.setTooltipContent(courtNom(b.name)); }
   b.last=p;
   drawVector(b);
   updateBoatStyle(b);
@@ -1530,10 +1540,11 @@ function renderLegend(){
   var el=$('legend');
   var ks=Object.keys(boats).filter(function(k){return !onlineOnly||isOnline(boats[k]);});
   var total=Object.keys(boats).length,hidden=total-ks.length;
-  var head=ks.length+' bateau'+(ks.length>1?'x':'');
+  var head='<span id="lgtog" style="cursor:pointer">'+(legOpen?'▾':'▸')+'</span> '+ks.length+' bateau'+(ks.length>1?'x':'');
   if(onlineOnly&&hidden>0)head+=' · '+hidden+' masqué'+(hidden>1?'s':'');
   var html='<div class="lgh">'+head+' · <label><input type="checkbox" id="nameToggle"'+(showNames?' checked':'')+'> Noms</label> · <label><input type="checkbox" id="onlineToggle"'+(onlineOnly?' checked':'')+'> Émet</label></div>';
   ks.sort(function(a,bk){return (boats[a].name||'').localeCompare(boats[bk].name||'');});
+  if(!legOpen)ks=[];
   ks.forEach(function(k){var b=boats[k];var on=isOnline(b);
     var right;
     if(on){
@@ -1544,6 +1555,8 @@ function renderLegend(){
     html+='<div class="lgi'+(on?'':' off')+'" data-id="'+k+'"><span class="dot" style="background:'+(on?b.color:'#6b7f8c')+'"></span><span>'+esc(b.name)+'</span><span class="sp'+(on?'':' offsp')+'">'+right+'</span><span class="del" data-del="'+k+'" title="Retirer de la flotte">✕</span></div>';});
   html+='<div class="lgexp">⤓ Traces flotte : <a href="/api/fleets/'+fid+'/export?format=gpx">GPX</a> · <a href="/api/fleets/'+fid+'/export?format=csv">CSV</a></div>';
   el.innerHTML=html;
+  var tg=$('lgtog');
+  if(tg)tg.onclick=function(e){e.stopPropagation();legOpen=!legOpen;renderLegend();};
   var ntg=$('nameToggle');if(ntg)ntg.onchange=function(){showNames=this.checked;applyNames();};
   var otg=$('onlineToggle');if(otg)otg.onchange=function(){onlineOnly=this.checked;applyVisibility();renderLegend();};
   var rows=el.querySelectorAll('.lgi');
@@ -2030,6 +2043,7 @@ function loadBoats(fid){
         var st=x.last?(on?((x.last[3]!=null?(Math.round(x.last[3]*10)/10)+' kt':'en ligne')):('vu '+age(x.last[2]))):'jamais vu';
         return '<div class="boat"><span class="dot" style="background:'+(on?'#37c871':'#6b7f8c')+'"></span>'
           +'<span class="bn">'+esc(x.name)+'</span><span class="bs">'+st+'</span>'
+          +'<span class="x" data-ren="'+x.id+'|'+esc(x.name)+'">✎</span>'
           +'<span class="x" data-rm="'+fid+'|'+x.id+'|'+esc(x.name)+'">✕</span></div>';
       }).join('');
     }
@@ -2039,7 +2053,8 @@ function loadBoats(fid){
         +'<input type="file" data-bfile="'+fid+'" accept=".txt,.csv,.tsv,.xlsx" style="padding:8px">'
         +'<div class="lbl" style="margin-top:10px">Ou coller une liste</div>'
         +'<textarea data-blk="'+fid+'" placeholder="Une ligne par bateau&#10;Magenta ; 205560470" style="min-height:70px;margin-bottom:6px"></textarea>'
-        +'<button class="sec" data-bgo="'+fid+'">Importer la liste collée</button>'
+        +'<button class="sec" data-bgo="'+fid+'">Analyser la liste collée</button>'
+        +'<div data-prev="'+fid+'"></div>'
         +'<div class="lbl" style="margin-top:12px">Ou un bateau à la fois</div>'
         +'<input data-mn="'+fid+'" placeholder="Nom du bateau" maxlength="40">'
         +'<input data-mm="'+fid+'" placeholder="MMSI (9 chiffres)" inputmode="numeric" maxlength="9" style="margin-top:6px">'
@@ -2049,13 +2064,37 @@ function loadBoats(fid){
         +'ajoutée dans la variable <code>AIS_API_KEY</code> sur le serveur. Tant qu\\'elle manque, les bateaux ne peuvent être suivis '
         +'que par l\\'application Traccar (lien d\\'invitation).</p>';
     }
+    box.querySelectorAll('[data-ren]').forEach(function(s){s.onclick=function(){
+      var pr=this.getAttribute('data-ren').split('|');
+      var nv=prompt('Nom du bateau :',pr[1]); if(!nv||!nv.trim())return;
+      api('/api/admin/boats/'+pr[0],{method:'POST',body:JSON.stringify({name:nv.trim()})}).then(function(){loadBoats(fid);});
+    };});
     box.querySelectorAll('[data-rm]').forEach(function(s){s.onclick=function(){
       var parts=this.getAttribute('data-rm').split('|');
       if(!confirm('Retirer '+parts[2]+' de la flotte ?'))return;
       fetch('/api/fleets/'+parts[0]+'/remove',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({trackId:parts[1]})})
         .then(function(){loadBoats(parts[0]);reload();});
     };});
-    function envoiImport(fid,charge){
+    var derniereCharge=null;
+    function afficheApercu(fid,d){
+      var z=box.querySelector('[data-prev="'+fid+'"]');
+      if(!d.apercu||!d.apercu.length){z.innerHTML='<p class="sub">Aucun MMSI trouvé dans ce contenu.</p>';return;}
+      var ex=d.apercu[0];
+      var h='<p class="sub" style="margin:10px 0 4px">'+d.lignes+' ligne(s) lues. Choisis la colonne contenant le nom du bateau :</p>';
+      ex.champs.forEach(function(c,i){
+        h+='<div style="display:flex;gap:8px;align-items:center;margin:3px 0">'
+         +'<button class="sec" data-col="'+(i+1)+'" style="width:auto;padding:6px 10px;margin:0">'+(i+1)+'</button>'
+         +'<span style="font-size:13px;color:var(--ink);overflow:hidden;text-overflow:ellipsis;white-space:nowrap">'+esc(c)+'</span></div>';
+      });
+      h+='<div style="margin-top:6px"><button class="sec" data-col="auto" style="width:auto;padding:6px 10px">Automatique</button></div>'
+       +'<p class="sub" style="margin-top:6px">MMSI détecté sur cette ligne : '+esc(ex.mmsi)+'</p>';
+      z.innerHTML=h;
+      z.querySelectorAll('[data-col]').forEach(function(b){b.onclick=function(){
+        var c=this.getAttribute('data-col');
+        lanceImport(fid,Object.assign({},derniereCharge,{colonne:c==='auto'?'':c}));
+      };});
+    }
+    function lanceImport(fid,charge){
       var m=document.querySelector('[data-msg="'+fid+'"]');
       say(m,'Import en cours…','');
       fetch('/api/fleets/'+fid+'/mmsi/import',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(charge)})
@@ -2064,15 +2103,26 @@ function loadBoats(fid){
          var txt=d.ajoutes+' ajouté(s), '+d.deja+' déjà suivi(s) — '+d.trouves+' MMSI sur '+d.lignes+' ligne(s).';
          if(d.noms&&d.noms.length)txt+=' Ex. : '+d.noms.join(', ');
          say(m,txt,'ok');
+         var z=box.querySelector('[data-prev="'+fid+'"]'); if(z)z.innerHTML='';
          var ta=box.querySelector('[data-blk="'+fid+'"]'); if(ta)ta.value='';
          loadBoats(fid);reload();
+       }).catch(function(){say(m,'Erreur réseau.','err');});
+    }
+    function demandeApercu(fid,charge){
+      derniereCharge=charge;
+      var m=document.querySelector('[data-msg="'+fid+'"]');
+      say(m,'Analyse…','');
+      fetch('/api/fleets/'+fid+'/mmsi/import',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(Object.assign({apercu:true},charge))})
+       .then(function(r){return r.json();}).then(function(d){
+         if(d.error){say(m,d.error,'err');return;}
+         say(m,'','');afficheApercu(fid,d);
        }).catch(function(){say(m,'Erreur réseau.','err');});
     }
     var bgo=box.querySelector('[data-bgo]');
     if(bgo)bgo.onclick=function(){
       var txt=box.querySelector('[data-blk="'+fid+'"]').value;
       if(!txt.trim()){say(document.querySelector('[data-msg="'+fid+'"]'),'Colle une liste d\\'abord.','err');return;}
-      envoiImport(fid,{text:txt});
+      demandeApercu(fid,{text:txt});
     };
     var bfile=box.querySelector('[data-bfile]');
     if(bfile)bfile.onchange=function(){
@@ -2081,10 +2131,7 @@ function loadBoats(fid){
       if(f.size>4000000){say(m,'Fichier trop volumineux (4 Mo maximum).','err');return;}
       say(m,'Lecture de '+f.name+'…','');
       var fr=new FileReader();
-      fr.onload=function(){
-        var b64=String(fr.result).split(',')[1]||'';
-        envoiImport(fid,{name:f.name,b64:b64});
-      };
+      fr.onload=function(){ demandeApercu(fid,{name:f.name,b64:String(fr.result).split(',')[1]||''}); };
       fr.onerror=function(){say(m,'Lecture du fichier impossible.','err');};
       fr.readAsDataURL(f);
     };
@@ -2138,7 +2185,7 @@ boot();
 </html>
 `;
 const ICONS = { '/icon-180.png': Buffer.from('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', 'base64'), '/icon-192.png': Buffer.from('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', 'base64'), '/icon-512.png': Buffer.from('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', 'base64') };
-const BUILD = '22/07 18:37';
+const BUILD = '22/07 18:54';
 const LEAFLET_JS = `/* @preserve
  * Leaflet 1.9.4, a JS library for interactive maps. https://leafletjs.com
  * (c) 2010-2023 Vladimir Agafonkin, (c) 2010-2011 CloudMade
@@ -2992,6 +3039,15 @@ const server = http.createServer(async (req, res) => {
         return json(res, 200, { id: fid, name: f.name });
       }
 
+      const mAdmB = p.match(/^\/api\/admin\/boats\/([a-f0-9]{16})$/);
+      if (mAdmB && req.method === 'POST') {
+        let body; try { body = await readBody(req); } catch { return json(res, 400, { error: 'json' }); }
+        const nm = String(body.name || '').trim().slice(0, 80);
+        if (!nm) return json(res, 400, { error: 'Nom vide' });
+        const meta = await store.getMeta(mAdmB[1]); if (!meta) return json(res, 404, { error: 'bateau introuvable' });
+        meta.name = nm; await store.setMeta(meta); await aisRefresh(false);
+        return json(res, 200, { id: mAdmB[1], name: nm });
+      }
       const mAdmF = p.match(/^\/api\/admin\/fleets\/([a-f0-9]{16})$/);
       if (mAdmF && req.method === 'POST') {
         let body; try { body = await readBody(req); } catch { return json(res, 400, { error: 'json' }); }
@@ -3045,7 +3101,19 @@ const server = http.createServer(async (req, res) => {
         if (body.b64) lignes = lignesDepuisFichier(body.name || '', Buffer.from(String(body.b64), 'base64'));
         else if (body.text) lignes = String(body.text).split(/\r?\n/);
       } catch { return json(res, 400, { error: 'Fichier illisible' }); }
-      const items = parseMmsiLignes(lignes).slice(0, 200);
+      if (body.apercu) {
+        const ex = [];
+        for (const l of lignes) {
+          const ch = champsLigne(l);
+          const nums = (String(l).match(/\b\d{9}\b/g) || []);
+          if (!nums.length) continue;
+          ex.push({ champs: ch.slice(0, 12), mmsi: nums.find((v) => !mmsiEcarte(v)) || nums[0] });
+          if (ex.length >= 3) break;
+        }
+        return json(res, 200, { apercu: ex, lignes: lignes.length });
+      }
+      const col = (body.colonne === null || body.colonne === undefined || body.colonne === '') ? null : (parseInt(body.colonne, 10) - 1);
+      const items = parseMmsiLignes(lignes, (col !== null && col >= 0) ? col : null).slice(0, 200);
       if (!items.length) return json(res, 400, { error: 'Aucun MMSI a 9 chiffres trouve dans ce contenu' });
       const known = await store.mmsiAll();
       const bilan = { lignes: lignes.length, trouves: items.length, ajoutes: 0, deja: 0, noms: [] };
