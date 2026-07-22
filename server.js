@@ -8,6 +8,7 @@
 const http = require('http');
 const fs = require('fs');
 const path = require('path');
+const zlib = require('zlib');
 const crypto = require('crypto');
 
 const PORT = process.env.PORT || 8080;
@@ -23,6 +24,90 @@ const key24 = () => crypto.randomBytes(12).toString('hex');
 const sha = (s) => crypto.createHash('sha256').update(String(s)).digest('hex');
 const num = (v) => (typeof v === 'number' && isFinite(v)) ? v : null;
 const r6 = (v) => Math.round(v * 1e6) / 1e6;
+
+/* ---- import de listes de MMSI (txt / csv / xlsx) ---- */
+function xmlDec(t) {
+  return String(t).replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&quot;/g, '"').replace(/&apos;/g, "'")
+    .replace(/&#(\d+);/g, (m, d) => String.fromCharCode(parseInt(d, 10))).replace(/&amp;/g, '&');
+}
+function zipRead(buf) {
+  let eo = -1;
+  for (let i = buf.length - 22; i >= 0 && i > buf.length - 70000; i--) { if (buf.readUInt32LE(i) === 0x06054b50) { eo = i; break; } }
+  if (eo < 0) return null;
+  const n = buf.readUInt16LE(eo + 10); let p = buf.readUInt32LE(eo + 16);
+  const out = {};
+  for (let k = 0; k < n; k++) {
+    if (p + 46 > buf.length || buf.readUInt32LE(p) !== 0x02014b50) break;
+    const method = buf.readUInt16LE(p + 10), csize = buf.readUInt32LE(p + 20);
+    const nl = buf.readUInt16LE(p + 28), el = buf.readUInt16LE(p + 30), cl = buf.readUInt16LE(p + 32);
+    const lho = buf.readUInt32LE(p + 42);
+    const name = buf.slice(p + 46, p + 46 + nl).toString('utf8');
+    const lnl = buf.readUInt16LE(lho + 26), lel = buf.readUInt16LE(lho + 28);
+    const start = lho + 30 + lnl + lel;
+    out[name] = { method, data: buf.slice(start, start + csize) };
+    p += 46 + nl + el + cl;
+  }
+  return out;
+}
+function zipGet(z, name) {
+  const e = z && z[name]; if (!e) return null;
+  if (e.method === 0) return e.data;
+  try { return zlib.inflateRawSync(e.data); } catch { return null; }
+}
+function xlsxLines(buf) {
+  const z = zipRead(buf); if (!z) return [];
+  const shared = [];
+  const ss = zipGet(z, 'xl/sharedStrings.xml');
+  if (ss) {
+    const t = ss.toString('utf8');
+    for (const si of t.split(/<si[ >]/).slice(1)) {
+      let txt = ''; for (const m of si.matchAll(/<t[^>]*>([\s\S]*?)<\/t>/g)) txt += m[1];
+      shared.push(xmlDec(txt));
+    }
+  }
+  const feuilles = Object.keys(z).filter((k) => /^xl\/worksheets\/sheet\d+\.xml$/.test(k)).sort();
+  const lignes = [];
+  for (const f of feuilles) {
+    const sh = zipGet(z, f); if (!sh) continue;
+    const xml = sh.toString('utf8');
+    for (const r of xml.matchAll(/<row[^>]*>([\s\S]*?)<\/row>/g)) {
+      const cells = [];
+      for (const c of r[1].matchAll(/<c([^>]*)>([\s\S]*?)<\/c>|<c([^>]*)\/>/g)) {
+        const attrs = c[1] || c[3] || '', inner = c[2] || '';
+        const ty = (attrs.match(/\st="([^"]+)"/) || [])[1];
+        const vm = inner.match(/<v>([\s\S]*?)<\/v>/), tm = inner.match(/<t[^>]*>([\s\S]*?)<\/t>/);
+        let v = '';
+        if (ty === 's' && vm) v = shared[parseInt(vm[1], 10)] || '';
+        else if (tm) v = xmlDec(tm[1]);
+        else if (vm) v = vm[1];
+        cells.push(v);
+      }
+      if (cells.length) lignes.push(cells.join(' | '));
+    }
+  }
+  return lignes;
+}
+/* prefixes reserves : 970 SART, 972 homme a la mer, 974 balise de detresse, 99x aides a la navigation */
+const mmsiEcarte = (v) => /^(97[0245]|99)/.test(v);
+function parseMmsiLignes(lignes) {
+  const items = [];
+  for (const brut of lignes) {
+    const ligne = String(brut).replace(/\u00a0/g, ' ').trim();
+    if (!ligne) continue;
+    const nums = (ligne.match(/\b\d{9}\b/g) || []);
+    if (!nums.length) continue;
+    const mmsi = nums.find((v) => !mmsiEcarte(v)) || nums[0];
+    let nom = ligne; for (const n of nums) nom = nom.split(n).join(' ');
+    nom = nom.replace(/[;,\t|]+/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 80);
+    if (/^(mmsi|n°|no|numero)$/i.test(nom)) continue;
+    items.push({ name: nom, mmsi });
+  }
+  return items;
+}
+function lignesDepuisFichier(nom, buf) {
+  if (/\.xlsx$/i.test(nom || '')) return xlsxLines(buf);
+  return buf.toString('utf8').split(/\r?\n/);
+}
 
 // --- Export traces (GPX / CSV) ---
 function isoT(ms){ try { return new Date(ms).toISOString().replace(/\.\d+Z$/, 'Z'); } catch { return ''; } }
@@ -1381,6 +1466,7 @@ function updateBoatStyle(b){
   if(!b.marker)return;var on=isOnline(b);
   b.marker.setStyle({fillOpacity:on?1:0.3,color:on?'#fff':'#9fb0bd',weight:on?1.6:1});
   if(b.trace)b.trace.setStyle({opacity:on?0.85:0.25});
+  if(b.vec)b.vec.setStyle({color:on?b.color:'#6b7f8c',opacity:on?0.95:0.3});
   var tt=b.marker.getTooltip&&b.marker.getTooltip();if(tt&&tt.setOpacity)tt.setOpacity(on?1:0.5);
 }
 var onlineOnly=false;
@@ -1388,6 +1474,7 @@ function applyVisibility(){
   for(var k in boats){var b=boats[k];var vis=!onlineOnly||isOnline(b);
     if(b.marker){if(vis){if(!map.hasLayer(b.marker))b.marker.addTo(map);}else if(map.hasLayer(b.marker))map.removeLayer(b.marker);}
     if(b.trace){if(vis){if(!map.hasLayer(b.trace))b.trace.addTo(map);}else if(map.hasLayer(b.trace))map.removeLayer(b.trace);}
+    if(b.vec){if(vis){if(!map.hasLayer(b.vec))b.vec.addTo(map);}else if(map.hasLayer(b.vec))map.removeLayer(b.vec);}
   }
 }
 function ensureBoat(id,name){
@@ -1396,6 +1483,23 @@ function ensureBoat(id,name){
   boats[id]={name:name||'Bateau',color:c,last:null,marker:null,trace:L.polyline([],{color:c,weight:3,opacity:.85}).addTo(map)};
   return boats[id];
 }
+/* vecteur de cap : longueur a l'ecran, proportionnelle a la vitesse */
+function vecEnd(ll,cog,sog){
+  var px=14+Math.min(38,(sog||0)*2.6);
+  var pt=map.latLngToLayerPoint(ll);
+  var rad=cog*Math.PI/180;
+  return map.layerPointToLatLng(L.point(pt.x+Math.sin(rad)*px, pt.y-Math.cos(rad)*px));
+}
+function drawVector(b){
+  var p=b.last;
+  if(!p||p[4]==null){ if(b.vec){map.removeLayer(b.vec);b.vec=null;} return; }
+  var ll=[p[0],p[1]], end=vecEnd(ll,p[4],p[3]||0), on=isOnline(b);
+  if(!b.vec){ b.vec=L.polyline([ll,end],{color:b.color,weight:2.4,opacity:on?0.95:0.3,interactive:false}).addTo(map); }
+  else { b.vec.setLatLngs([ll,end]); b.vec.setStyle({color:on?b.color:'#6b7f8c',opacity:on?0.95:0.3}); }
+}
+function redrawVectors(){for(var k in boats){var b=boats[k];if(b.vec||((b.last)&&b.last[4]!=null))drawVector(b);}applyVisibility();}
+map.on('zoomend',redrawVectors);
+
 function boatAdd(id,name,p){
   var b=ensureBoat(id,name);
   var ll=[p[0],p[1]];
@@ -1406,6 +1510,7 @@ function boatAdd(id,name,p){
     if(!showNames) b.marker.closeTooltip();
   } else { b.marker.setLatLng(ll); b.marker.setTooltipContent(b.name); }
   b.last=p;
+  drawVector(b);
   updateBoatStyle(b);
   applyVisibility();
   renderLegend();
@@ -1420,7 +1525,12 @@ function renderLegend(){
   var html='<div class="lgh">'+head+' · <label><input type="checkbox" id="nameToggle"'+(showNames?' checked':'')+'> Noms</label> · <label><input type="checkbox" id="onlineToggle"'+(onlineOnly?' checked':'')+'> Émet</label></div>';
   ks.sort(function(a,bk){return (boats[a].name||'').localeCompare(boats[bk].name||'');});
   ks.forEach(function(k){var b=boats[k];var on=isOnline(b);
-    var right=on?((b.last&&b.last[3]!=null)?(Math.round(b.last[3]*10)/10)+' kt':'—'):(b.last?'vu '+fmtAge(b.last[2]):'—');
+    var right;
+    if(on){
+      var sp=(b.last&&b.last[3]!=null)?(Math.round(b.last[3]*10)/10)+' kt':'—';
+      var cp=(b.last&&b.last[4]!=null)?(Math.round(b.last[4])+'°'):'';
+      right=cp?(sp+' · '+cp):sp;
+    } else right=(b.last?'vu '+fmtAge(b.last[2]):'—');
     html+='<div class="lgi'+(on?'':' off')+'" data-id="'+k+'"><span class="dot" style="background:'+(on?b.color:'#6b7f8c')+'"></span><span>'+esc(b.name)+'</span><span class="sp'+(on?'':' offsp')+'">'+right+'</span><span class="del" data-del="'+k+'" title="Retirer de la flotte">✕</span></div>';});
   html+='<div class="lgexp">⤓ Traces flotte : <a href="/api/fleets/'+fid+'/export?format=gpx">GPX</a> · <a href="/api/fleets/'+fid+'/export?format=csv">CSV</a></div>';
   el.innerHTML=html;
@@ -1429,7 +1539,7 @@ function renderLegend(){
   var rows=el.querySelectorAll('.lgi');
   for(var i=0;i<rows.length;i++){rows[i].onclick=function(){var b=boats[this.getAttribute('data-id')];if(b&&b.last)map.setView([b.last[0],b.last[1]],Math.max(map.getZoom(),12));};}
   var dels=el.querySelectorAll('.del');
-  for(var d=0;d<dels.length;d++){dels[d].onclick=function(ev){ev.stopPropagation();var did=this.getAttribute('data-del');var b=boats[did];if(!confirm('Retirer '+((b&&b.name)||'ce bateau')+' de la flotte ?'))return;fetch('/api/fleets/'+fid+'/remove',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({trackId:did})}).then(function(){if(b){if(b.marker)map.removeLayer(b.marker);if(b.trace)map.removeLayer(b.trace);}delete boats[did];renderLegend();}).catch(function(){});};}
+  for(var d=0;d<dels.length;d++){dels[d].onclick=function(ev){ev.stopPropagation();var did=this.getAttribute('data-del');var b=boats[did];if(!confirm('Retirer '+((b&&b.name)||'ce bateau')+' de la flotte ?'))return;fetch('/api/fleets/'+fid+'/remove',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({trackId:did})}).then(function(){if(b){if(b.marker)map.removeLayer(b.marker);if(b.trace)map.removeLayer(b.trace);if(b.vec)map.removeLayer(b.vec);}delete boats[did];renderLegend();}).catch(function(){});};}
 }
 function refreshStatus(){for(var k in boats)updateBoatStyle(boats[k]);applyVisibility();renderLegend();}
 setInterval(refreshStatus,30000);
@@ -1443,6 +1553,7 @@ else{
     if(d.error){$('flname').textContent='Flotte introuvable';$('flcount').textContent='';return;}
     $('flname').textContent=d.name||'Flotte';
     (d.boats||[]).forEach(function(bo){ if(bo.last) boatAdd(bo.id,bo.name,bo.last); else ensureBoat(bo.id,bo.name); });
+    redrawVectors();
     renderLegend(); fitAll(); subscribe();
   }).catch(function(){$('flcount').textContent='Erreur de chargement';});
 }
@@ -1451,7 +1562,7 @@ function subscribe(){
   es.onopen=function(){$('flcount').textContent='En direct';};
   es.onerror=function(){$('flcount').textContent='Reconnexion…';};
   es.onmessage=function(ev){ try{var m=JSON.parse(ev.data);
-    if(m&&m.rm){ var b=boats[m.rm]; if(b){ if(b.marker)map.removeLayer(b.marker); if(b.trace)map.removeLayer(b.trace); delete boats[m.rm]; renderLegend(); } return; }
+    if(m&&m.rm){ var b=boats[m.rm]; if(b){ if(b.marker)map.removeLayer(b.marker); if(b.trace)map.removeLayer(b.trace); if(b.vec)map.removeLayer(b.vec); delete boats[m.rm]; renderLegend(); } return; }
     if(m&&m.p) boatAdd(m.b,m.n,m.p);
   }catch(e){} };
 }
@@ -1914,8 +2025,11 @@ function loadBoats(fid){
     }
     box.innerHTML+='<div class="lbl" style="margin-top:12px">Ajouter un bateau par AIS (MMSI)</div>';
     if(AIS){
-      box.innerHTML+='<textarea data-blk="'+fid+'" placeholder="Import en masse : une ligne par bateau&#10;Nom ; MMSI&#10;Magenta ; 205560470" style="min-height:80px;margin-bottom:6px"></textarea>'
-        +'<button class="sec" data-bgo="'+fid+'">Importer la liste</button>'
+      box.innerHTML+='<div class="lbl" style="margin-top:4px">Importer un fichier (txt, csv, xlsx)</div>'
+        +'<input type="file" data-bfile="'+fid+'" accept=".txt,.csv,.tsv,.xlsx" style="padding:8px">'
+        +'<div class="lbl" style="margin-top:10px">Ou coller une liste</div>'
+        +'<textarea data-blk="'+fid+'" placeholder="Une ligne par bateau&#10;Magenta ; 205560470" style="min-height:70px;margin-bottom:6px"></textarea>'
+        +'<button class="sec" data-bgo="'+fid+'">Importer la liste collée</button>'
         +'<div class="lbl" style="margin-top:12px">Ou un bateau à la fois</div>'
         +'<input data-mn="'+fid+'" placeholder="Nom du bateau" maxlength="40">'
         +'<input data-mm="'+fid+'" placeholder="MMSI (9 chiffres)" inputmode="numeric" maxlength="9" style="margin-top:6px">'
@@ -1931,28 +2045,38 @@ function loadBoats(fid){
       fetch('/api/fleets/'+parts[0]+'/remove',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({trackId:parts[1]})})
         .then(function(){loadBoats(parts[0]);reload();});
     };});
+    function envoiImport(fid,charge){
+      var m=document.querySelector('[data-msg="'+fid+'"]');
+      say(m,'Import en cours…','');
+      fetch('/api/fleets/'+fid+'/mmsi/import',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(charge)})
+       .then(function(r){return r.json();}).then(function(d){
+         if(d.error){say(m,d.error,'err');return;}
+         var txt=d.ajoutes+' ajouté(s), '+d.deja+' déjà suivi(s) — '+d.trouves+' MMSI sur '+d.lignes+' ligne(s).';
+         if(d.noms&&d.noms.length)txt+=' Ex. : '+d.noms.join(', ');
+         say(m,txt,'ok');
+         var ta=box.querySelector('[data-blk="'+fid+'"]'); if(ta)ta.value='';
+         loadBoats(fid);reload();
+       }).catch(function(){say(m,'Erreur réseau.','err');});
+    }
     var bgo=box.querySelector('[data-bgo]');
     if(bgo)bgo.onclick=function(){
       var txt=box.querySelector('[data-blk="'+fid+'"]').value;
+      if(!txt.trim()){say(document.querySelector('[data-msg="'+fid+'"]'),'Colle une liste d\\'abord.','err');return;}
+      envoiImport(fid,{text:txt});
+    };
+    var bfile=box.querySelector('[data-bfile]');
+    if(bfile)bfile.onchange=function(){
+      var f=this.files&&this.files[0]; if(!f)return;
       var m=document.querySelector('[data-msg="'+fid+'"]');
-      var items=[];
-      txt.split(/\\n/).forEach(function(l){
-        l=l.trim(); if(!l)return;
-        var mm=l.match(/\\b\\d{9}\\b/); if(!mm)return;
-        var nom=l.replace(mm[0],'').replace(/[;,\\t|]+/g,' ').trim();
-        items.push({name:nom,mmsi:mm[0]});
-      });
-      if(!items.length){say(m,'Aucun MMSI à 9 chiffres trouvé.','err');return;}
-      say(m,'Import de '+items.length+' bateaux…','');
-      this.disabled=true; var b=this;
-      fetch('/api/fleets/'+fid+'/mmsi/bulk',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({items:items})})
-       .then(function(r){return r.json();}).then(function(d){
-         b.disabled=false;
-         if(d.error){say(m,d.error,'err');return;}
-         say(m,d.ajoutes+' ajouté(s), '+d.deja+' déjà suivi(s)'+(d.invalides.length?', '+d.invalides.length+' ignoré(s)':'')+'.','ok');
-         box.querySelector('[data-blk="'+fid+'"]').value='';
-         loadBoats(fid);reload();
-       }).catch(function(){b.disabled=false;say(m,'Erreur réseau.','err');});
+      if(f.size>4000000){say(m,'Fichier trop volumineux (4 Mo maximum).','err');return;}
+      say(m,'Lecture de '+f.name+'…','');
+      var fr=new FileReader();
+      fr.onload=function(){
+        var b64=String(fr.result).split(',')[1]||'';
+        envoiImport(fid,{name:f.name,b64:b64});
+      };
+      fr.onerror=function(){say(m,'Lecture du fichier impossible.','err');};
+      fr.readAsDataURL(f);
     };
     var add=box.querySelector('[data-madd]');
     if(add)add.onclick=function(){
@@ -2004,7 +2128,7 @@ boot();
 </html>
 `;
 const ICONS = { '/icon-180.png': Buffer.from('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', 'base64'), '/icon-192.png': Buffer.from('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', 'base64'), '/icon-512.png': Buffer.from('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', 'base64') };
-const BUILD = '22/07 18:18';
+const BUILD = '22/07 18:36';
 const LEAFLET_JS = `/* @preserve
  * Leaflet 1.9.4, a JS library for interactive maps. https://leafletjs.com
  * (c) 2010-2023 Vladimir Agafonkin, (c) 2010-2011 CloudMade
@@ -2900,31 +3024,35 @@ const server = http.createServer(async (req, res) => {
         return json(res, 200, { aisIntervalMin: mn });
       }
     }
-    const mFleetBulk = p.match(/^\/api\/fleets\/([a-f0-9]{16})\/mmsi\/bulk$/);
-    if (mFleetBulk && req.method === 'POST') {
-      const fid = mFleetBulk[1];
+    const mFleetImp = p.match(/^\/api\/fleets\/([a-f0-9]{16})\/mmsi\/import$/);
+    if (mFleetImp && req.method === 'POST') {
+      const fid = mFleetImp[1];
       const fleet = await store.fleetGet(fid); if (!fleet) return json(res, 404, { error: 'flotte introuvable' });
       if (!AIS_KEY && !VAPI_KEY) return json(res, 503, { error: 'Suivi AIS non configure sur ce serveur' });
       let body; try { body = await readBody(req); } catch { return json(res, 400, { error: 'json' }); }
-      const items = Array.isArray(body.items) ? body.items.slice(0, 200) : [];
-      if (!items.length) return json(res, 400, { error: 'Aucune ligne exploitable' });
+      let lignes = [];
+      try {
+        if (body.b64) lignes = lignesDepuisFichier(body.name || '', Buffer.from(String(body.b64), 'base64'));
+        else if (body.text) lignes = String(body.text).split(/\r?\n/);
+      } catch { return json(res, 400, { error: 'Fichier illisible' }); }
+      const items = parseMmsiLignes(lignes).slice(0, 200);
+      if (!items.length) return json(res, 400, { error: 'Aucun MMSI a 9 chiffres trouve dans ce contenu' });
       const known = await store.mmsiAll();
-      const res2 = { ajoutes: 0, deja: 0, invalides: [] };
+      const bilan = { lignes: lignes.length, trouves: items.length, ajoutes: 0, deja: 0, noms: [] };
       for (const it of items) {
-        const mmsi = String(it && it.mmsi || '').replace(/[^0-9]/g, '');
-        const nom = String(it && it.name || '').trim().slice(0, 80) || ('MMSI ' + mmsi);
-        if (!/^[0-9]{9}$/.test(mmsi)) { res2.invalides.push(String(it && it.mmsi || '?')); continue; }
-        if (known[mmsi]) { await store.fleetAdd(fid, known[mmsi]); res2.deja++; continue; }
+        const mmsi = it.mmsi, nom = it.name || ('MMSI ' + mmsi);
+        if (known[mmsi]) { await store.fleetAdd(fid, known[mmsi]); bilan.deja++; continue; }
         const id = id16(), publishKey = key24();
         const meta = { id, name: nom, keyHash: sha(publishKey), createdAt: Date.now(), fleets: [fid], mmsi: mmsi };
         await store.create(meta);
         await store.fleetAdd(fid, id);
         await store.mmsiSet(mmsi, id);
         known[mmsi] = id;
-        res2.ajoutes++;
+        bilan.ajoutes++;
+        if (bilan.noms.length < 5) bilan.noms.push(nom + ' (' + mmsi + ')');
       }
       await aisRefresh(false);
-      return json(res, 201, res2);
+      return json(res, 201, bilan);
     }
     const mFleetMmsi = p.match(/^\/api\/fleets\/([a-f0-9]{16})\/mmsi$/);
     if (mFleetMmsi && req.method === 'POST') {
