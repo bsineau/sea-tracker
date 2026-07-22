@@ -231,11 +231,16 @@ function broadcast(id, point) {
   const msg = 'data: ' + JSON.stringify(point) + '\n\n';
   for (const res of set) { try { res.write(msg); } catch {} }
 }
-function serveHTML(res, html) { res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' }); res.end(html); }
+function serveHTML(res, html, reqUrl) {
+  const start = reqUrl || '/';
+  const href = '/manifest.webmanifest?s=' + encodeURIComponent(start);
+  res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+  res.end(html.replace('__MANIFEST__', href));
+}
 
 const PAGE_INDEX = `<!DOCTYPE html>
 <html lang="fr">
-<head><link rel="manifest" href="/manifest.webmanifest"><meta name="apple-mobile-web-app-capable" content="yes"><meta name="mobile-web-app-capable" content="yes"><meta name="apple-mobile-web-app-status-bar-style" content="black-translucent"><meta name="apple-mobile-web-app-title" content="Sea Tracker"><meta name="theme-color" content="#0a1a26"><link rel="apple-touch-icon" href="/icon-180.png"><link rel="icon" href="/icon-192.png"><script>(function(){var l=document.querySelector('link[rel=manifest]');if(l)l.href="/manifest.webmanifest?s="+encodeURIComponent(location.pathname+location.search);if("serviceWorker" in navigator)window.addEventListener("load",function(){navigator.serviceWorker.register("/sw.js").catch(function(){});});})();</script>
+<head><link rel="manifest" href="__MANIFEST__"><meta name="apple-mobile-web-app-capable" content="yes"><meta name="mobile-web-app-capable" content="yes"><meta name="apple-mobile-web-app-status-bar-style" content="black-translucent"><meta name="apple-mobile-web-app-title" content="Sea Tracker"><meta name="theme-color" content="#0a1a26"><link rel="apple-touch-icon" href="/icon-180.png"><link rel="icon" href="/icon-192.png"><script>if("serviceWorker" in navigator)window.addEventListener("load",function(){navigator.serviceWorker.register("/sw.js").catch(function(){});});</script>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <title>Sea Tracker</title>
@@ -329,12 +334,17 @@ document.getElementById('createFleet').onclick=function(){
   }).catch(function(){alert('Erreur de création flotte');});
 };
 </script>
+<div style="max-width:560px;margin:6px auto 30px;text-align:center">
+  <a href="/admin" style="display:inline-block;color:#39c0d3;text-decoration:none;font-size:14px;font-weight:600;
+     border:1px solid #1d3a4d;border-radius:10px;padding:11px 18px">⚓️ Console des flottes</a>
+  <div style="color:#8fb0c2;font-size:12px;margin-top:8px">Retrouver, suivre et gérer toutes tes flottes existantes.</div>
+</div>
 </body>
 </html>
 `;
 const PAGE_VIEWER = `<!DOCTYPE html>
 <html lang="fr">
-<head><link rel="manifest" href="/manifest.webmanifest"><meta name="apple-mobile-web-app-capable" content="yes"><meta name="mobile-web-app-capable" content="yes"><meta name="apple-mobile-web-app-status-bar-style" content="black-translucent"><meta name="apple-mobile-web-app-title" content="Sea Tracker"><meta name="theme-color" content="#0a1a26"><link rel="apple-touch-icon" href="/icon-180.png"><link rel="icon" href="/icon-192.png"><script>(function(){var l=document.querySelector('link[rel=manifest]');if(l)l.href="/manifest.webmanifest?s="+encodeURIComponent(location.pathname+location.search);if("serviceWorker" in navigator)window.addEventListener("load",function(){navigator.serviceWorker.register("/sw.js").catch(function(){});});})();</script>
+<head><link rel="manifest" href="__MANIFEST__"><meta name="apple-mobile-web-app-capable" content="yes"><meta name="mobile-web-app-capable" content="yes"><meta name="apple-mobile-web-app-status-bar-style" content="black-translucent"><meta name="apple-mobile-web-app-title" content="Sea Tracker"><meta name="theme-color" content="#0a1a26"><link rel="apple-touch-icon" href="/icon-180.png"><link rel="icon" href="/icon-192.png"><script>if("serviceWorker" in navigator)window.addEventListener("load",function(){navigator.serviceWorker.register("/sw.js").catch(function(){});});</script>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, viewport-fit=cover">
 <title>Suivi en direct</title>
@@ -716,7 +726,7 @@ function subscribe(){
 `;
 const PAGE_PUBLISHER = `<!DOCTYPE html>
 <html lang="fr">
-<head><link rel="manifest" href="/manifest.webmanifest"><meta name="apple-mobile-web-app-capable" content="yes"><meta name="mobile-web-app-capable" content="yes"><meta name="apple-mobile-web-app-status-bar-style" content="black-translucent"><meta name="apple-mobile-web-app-title" content="Sea Tracker"><meta name="theme-color" content="#0a1a26"><link rel="apple-touch-icon" href="/icon-180.png"><link rel="icon" href="/icon-192.png"><script>(function(){var l=document.querySelector('link[rel=manifest]');if(l)l.href="/manifest.webmanifest?s="+encodeURIComponent(location.pathname+location.search);if("serviceWorker" in navigator)window.addEventListener("load",function(){navigator.serviceWorker.register("/sw.js").catch(function(){});});})();</script>
+<head><link rel="manifest" href="__MANIFEST__"><meta name="apple-mobile-web-app-capable" content="yes"><meta name="mobile-web-app-capable" content="yes"><meta name="apple-mobile-web-app-status-bar-style" content="black-translucent"><meta name="apple-mobile-web-app-title" content="Sea Tracker"><meta name="theme-color" content="#0a1a26"><link rel="apple-touch-icon" href="/icon-180.png"><link rel="icon" href="/icon-192.png"><script>if("serviceWorker" in navigator)window.addEventListener("load",function(){navigator.serviceWorker.register("/sw.js").catch(function(){});});</script>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, viewport-fit=cover">
 <title>Émettre ma position</title>
@@ -940,7 +950,7 @@ if(queue.length)flush();
 `;
 const PAGE_METEO = `<!DOCTYPE html>
 <html lang="fr">
-<head><link rel="manifest" href="/manifest.webmanifest"><meta name="apple-mobile-web-app-capable" content="yes"><meta name="mobile-web-app-capable" content="yes"><meta name="apple-mobile-web-app-status-bar-style" content="black-translucent"><meta name="apple-mobile-web-app-title" content="Sea Tracker"><meta name="theme-color" content="#0a1a26"><link rel="apple-touch-icon" href="/icon-180.png"><link rel="icon" href="/icon-192.png"><script>(function(){var l=document.querySelector('link[rel=manifest]');if(l)l.href="/manifest.webmanifest?s="+encodeURIComponent(location.pathname+location.search);if("serviceWorker" in navigator)window.addEventListener("load",function(){navigator.serviceWorker.register("/sw.js").catch(function(){});});})();</script>
+<head><link rel="manifest" href="__MANIFEST__"><meta name="apple-mobile-web-app-capable" content="yes"><meta name="mobile-web-app-capable" content="yes"><meta name="apple-mobile-web-app-status-bar-style" content="black-translucent"><meta name="apple-mobile-web-app-title" content="Sea Tracker"><meta name="theme-color" content="#0a1a26"><link rel="apple-touch-icon" href="/icon-180.png"><link rel="icon" href="/icon-192.png"><script>if("serviceWorker" in navigator)window.addEventListener("load",function(){navigator.serviceWorker.register("/sw.js").catch(function(){});});</script>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, viewport-fit=cover">
 <title>Météo</title>
@@ -1048,7 +1058,7 @@ function windyFillLayers(sel, def) {
 `;
 const PAGE_FLEET = `<!DOCTYPE html>
 <html lang="fr">
-<head><link rel="manifest" href="/manifest.webmanifest"><meta name="apple-mobile-web-app-capable" content="yes"><meta name="mobile-web-app-capable" content="yes"><meta name="apple-mobile-web-app-status-bar-style" content="black-translucent"><meta name="apple-mobile-web-app-title" content="Sea Tracker"><meta name="theme-color" content="#0a1a26"><link rel="apple-touch-icon" href="/icon-180.png"><link rel="icon" href="/icon-192.png"><script>(function(){var l=document.querySelector('link[rel=manifest]');if(l)l.href="/manifest.webmanifest?s="+encodeURIComponent(location.pathname+location.search);if("serviceWorker" in navigator)window.addEventListener("load",function(){navigator.serviceWorker.register("/sw.js").catch(function(){});});})();</script>
+<head><link rel="manifest" href="__MANIFEST__"><meta name="apple-mobile-web-app-capable" content="yes"><meta name="mobile-web-app-capable" content="yes"><meta name="apple-mobile-web-app-status-bar-style" content="black-translucent"><meta name="apple-mobile-web-app-title" content="Sea Tracker"><meta name="theme-color" content="#0a1a26"><link rel="apple-touch-icon" href="/icon-180.png"><link rel="icon" href="/icon-192.png"><script>if("serviceWorker" in navigator)window.addEventListener("load",function(){navigator.serviceWorker.register("/sw.js").catch(function(){});});</script>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, viewport-fit=cover">
 <title>Suivi de flotte</title>
@@ -1291,7 +1301,7 @@ map.on('click',function(e){
 `;
 const PAGE_JOIN = `<!DOCTYPE html>
 <html lang="fr">
-<head><link rel="manifest" href="/manifest.webmanifest"><meta name="apple-mobile-web-app-capable" content="yes"><meta name="mobile-web-app-capable" content="yes"><meta name="apple-mobile-web-app-status-bar-style" content="black-translucent"><meta name="apple-mobile-web-app-title" content="Sea Tracker"><meta name="theme-color" content="#0a1a26"><link rel="apple-touch-icon" href="/icon-180.png"><link rel="icon" href="/icon-192.png"><script>(function(){var l=document.querySelector('link[rel=manifest]');if(l)l.href="/manifest.webmanifest?s="+encodeURIComponent(location.pathname+location.search);if("serviceWorker" in navigator)window.addEventListener("load",function(){navigator.serviceWorker.register("/sw.js").catch(function(){});});})();</script>
+<head><link rel="manifest" href="__MANIFEST__"><meta name="apple-mobile-web-app-capable" content="yes"><meta name="mobile-web-app-capable" content="yes"><meta name="apple-mobile-web-app-status-bar-style" content="black-translucent"><meta name="apple-mobile-web-app-title" content="Sea Tracker"><meta name="theme-color" content="#0a1a26"><link rel="apple-touch-icon" href="/icon-180.png"><link rel="icon" href="/icon-192.png"><script>if("serviceWorker" in navigator)window.addEventListener("load",function(){navigator.serviceWorker.register("/sw.js").catch(function(){});});</script>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <title>Rejoindre la flotte</title>
@@ -1410,7 +1420,7 @@ $('go').onclick=function(){
 `;
 const PAGE_ADMIN = `<!DOCTYPE html>
 <html lang="fr">
-<head><link rel="manifest" href="/manifest.webmanifest"><meta name="apple-mobile-web-app-capable" content="yes"><meta name="mobile-web-app-capable" content="yes"><meta name="apple-mobile-web-app-status-bar-style" content="black-translucent"><meta name="apple-mobile-web-app-title" content="Sea Tracker"><meta name="theme-color" content="#0a1a26"><link rel="apple-touch-icon" href="/icon-180.png"><link rel="icon" href="/icon-192.png"><script>(function(){var l=document.querySelector('link[rel=manifest]');if(l)l.href="/manifest.webmanifest?s="+encodeURIComponent(location.pathname+location.search);if("serviceWorker" in navigator)window.addEventListener("load",function(){navigator.serviceWorker.register("/sw.js").catch(function(){});});})();</script>
+<head><link rel="manifest" href="__MANIFEST__"><meta name="apple-mobile-web-app-capable" content="yes"><meta name="mobile-web-app-capable" content="yes"><meta name="apple-mobile-web-app-status-bar-style" content="black-translucent"><meta name="apple-mobile-web-app-title" content="Sea Tracker"><meta name="theme-color" content="#0a1a26"><link rel="apple-touch-icon" href="/icon-180.png"><link rel="icon" href="/icon-192.png"><script>if("serviceWorker" in navigator)window.addEventListener("load",function(){navigator.serviceWorker.register("/sw.js").catch(function(){});});</script>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <title>Console — Sea Tracker</title>
@@ -1945,17 +1955,21 @@ const server = http.createServer(async (req, res) => {
 
   if (p === '/windy.js') { res.writeHead(200, { 'Content-Type': 'text/javascript; charset=utf-8' }); return res.end(PAGE_WINDYJS); }
   if (p === '/config.js') { res.writeHead(200, { 'Content-Type': 'text/javascript; charset=utf-8' }); return res.end('window.OWM_KEY=' + JSON.stringify(process.env.OWM_API_KEY || '') + ';'); }
-  if (p === '/') return serveHTML(res, PAGE_INDEX);
-  if (p === '/v') return serveHTML(res, PAGE_VIEWER);
-  if (p === '/p') return serveHTML(res, PAGE_PUBLISHER);
-  if (p === '/meteo') return serveHTML(res, PAGE_METEO);
-  if (p === '/vf') return serveHTML(res, PAGE_FLEET);
-  if (p === '/join') return serveHTML(res, PAGE_JOIN);
+  if (p === '/') return serveHTML(res, PAGE_INDEX, req.url);
+  if (p === '/v') return serveHTML(res, PAGE_VIEWER, req.url);
+  if (p === '/p') return serveHTML(res, PAGE_PUBLISHER, req.url);
+  if (p === '/meteo') return serveHTML(res, PAGE_METEO, req.url);
+  if (p === '/vf') return serveHTML(res, PAGE_FLEET, req.url);
+  if (p === '/join') return serveHTML(res, PAGE_JOIN, req.url);
   if (ICONS[p]) { res.writeHead(200, { 'Content-Type': 'image/png', 'Cache-Control': 'public, max-age=604800' }); return res.end(ICONS[p]); }
   if (p === '/sw.js') { res.writeHead(200, { 'Content-Type': 'text/javascript; charset=utf-8', 'Cache-Control': 'no-cache' }); return res.end(SW_JS); }
   if (p === '/manifest.webmanifest') {
-    let start = u.searchParams.get('s') || '/';
-    if (start.charAt(0) !== '/' || start.charAt(1) === '/') start = '/';
+    let start = u.searchParams.get('s') || '';
+    if (!start) {
+      const ref = req.headers.referer || '';
+      try { const ru = new URL(ref); if (ru.host === (req.headers.host || ru.host)) start = ru.pathname + ru.search; } catch {}
+    }
+    if (!start || start.charAt(0) !== '/' || start.charAt(1) === '/') start = '/';
     const man = {
       name: 'Sea Tracker', short_name: 'Sea Tracker',
       description: 'Suivi de flotte en direct',
@@ -1970,7 +1984,7 @@ const server = http.createServer(async (req, res) => {
     res.writeHead(200, { 'Content-Type': 'application/manifest+json; charset=utf-8' });
     return res.end(JSON.stringify(man));
   }
-  if (p === '/admin') return serveHTML(res, PAGE_ADMIN);
+  if (p === '/admin') return serveHTML(res, PAGE_ADMIN, req.url);
   res.writeHead(404, { 'Content-Type': 'text/plain' }); res.end('404');
 });
 
