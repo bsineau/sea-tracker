@@ -157,7 +157,12 @@ const fileStore = {
   fleetMembers: async (fid) => { const f = fleetLoad(fid); return f ? f.members : []; },
   fleetRemove: async (fid, tid) => { const f = fleetLoad(fid); if (!f) return; f.members = f.members.filter((x) => x !== tid); fs.writeFileSync(fltPath(fid), JSON.stringify(f)); },
   devSet: async (kh, tid) => { let d = {}; try { d = JSON.parse(fs.readFileSync(path.join(DATA, 'devices.json'), 'utf8')); } catch {} d[kh] = tid; fs.writeFileSync(path.join(DATA, 'devices.json'), JSON.stringify(d)); },
-  devGet: async (kh) => { try { const d = JSON.parse(fs.readFileSync(path.join(DATA, 'devices.json'), 'utf8')); return d[kh] || null; } catch { return null; } }
+  devGet: async (kh) => { try { const d = JSON.parse(fs.readFileSync(path.join(DATA, 'devices.json'), 'utf8')); return d[kh] || null; } catch { return null; } },
+  mmsiAll: async () => { try { return JSON.parse(fs.readFileSync(path.join(DATA, 'mmsi.json'), 'utf8')); } catch { return {}; } },
+  mmsiSet: async (mmsi, tid) => { let d = {}; try { d = JSON.parse(fs.readFileSync(path.join(DATA, 'mmsi.json'), 'utf8')); } catch {} d[mmsi] = tid; fs.writeFileSync(path.join(DATA, 'mmsi.json'), JSON.stringify(d)); },
+  mmsiDel: async (mmsi) => { let d = {}; try { d = JSON.parse(fs.readFileSync(path.join(DATA, 'mmsi.json'), 'utf8')); } catch {} delete d[mmsi]; fs.writeFileSync(path.join(DATA, 'mmsi.json'), JSON.stringify(d)); },
+  cfgGet: async () => { try { return JSON.parse(fs.readFileSync(path.join(DATA, 'settings.json'), 'utf8')); } catch { return {}; } },
+  cfgSet: async (o) => { let d = {}; try { d = JSON.parse(fs.readFileSync(path.join(DATA, 'settings.json'), 'utf8')); } catch {} Object.assign(d, o); fs.writeFileSync(path.join(DATA, 'settings.json'), JSON.stringify(d)); }
 };
 
 /* ---- back-end Upstash Redis (REST) ---- */
@@ -188,7 +193,12 @@ const redisStore = {
   fleetMembers: async (fid) => { const a = await redisCmd(['LRANGE', rFltM(fid), '0', '-1']); return a || []; },
   fleetRemove: async (fid, tid) => { await redisCmd(['LREM', rFltM(fid), '0', tid]); },
   devSet: async (kh, tid) => { await redisCmd(['SET', 'dev:' + kh, tid]); },
-  devGet: async (kh) => { return await redisCmd(['GET', 'dev:' + kh]); }
+  devGet: async (kh) => { return await redisCmd(['GET', 'dev:' + kh]); },
+  mmsiAll: async () => { const a = await redisCmd(['HGETALL', 'mmsi']); const o = {}; if (Array.isArray(a)) { for (let i = 0; i < a.length; i += 2) o[a[i]] = a[i + 1]; } else if (a && typeof a === 'object') { Object.assign(o, a); } return o; },
+  mmsiSet: async (mmsi, tid) => { await redisCmd(['HSET', 'mmsi', mmsi, tid]); },
+  mmsiDel: async (mmsi) => { await redisCmd(['HDEL', 'mmsi', mmsi]); },
+  cfgGet: async () => { const v = await redisCmd(['GET', 'cfg']); try { return v ? JSON.parse(v) : {}; } catch { return {}; } },
+  cfgSet: async (o) => { const v = await redisCmd(['GET', 'cfg']); let d = {}; try { d = v ? JSON.parse(v) : {}; } catch {} Object.assign(d, o); await redisCmd(['SET', 'cfg', JSON.stringify(d)]); }
 };
 const store = USE_REDIS ? redisStore : fileStore;
 const fleetClients = new Map();
@@ -1254,12 +1264,57 @@ const PAGE_JOIN = `<!DOCTYPE html>
     </details>
   </div>
   <p id="err" class="err"></p>
+
+  <div id="aisBox" style="margin-top:18px;padding-top:14px;border-top:1px solid var(--line)">
+    <div class="lbl">Ou suivre un bateau par son AIS</div>
+    <p class="hint" style="margin-top:4px">Rien à installer à bord : si le bateau a un transpondeur AIS allumé, entre son <b>MMSI</b> (9 chiffres).</p>
+    <input id="aisName" placeholder="Nom du bateau" maxlength="40" autocomplete="off">
+    <input id="aisMmsi" placeholder="MMSI (9 chiffres)" maxlength="9" inputmode="numeric" autocomplete="off">
+    <button id="aisGo">Ajouter par MMSI</button>
+    <p id="aisMsg" class="hint"></p>
+    <div class="lbl" style="margin-top:10px">Enregistrement d'un point tous les</div>
+    <select id="aisInt" style="width:100%;background:#0a1e2c;color:var(--ink);border:1px solid var(--line);border-radius:10px;padding:10px;font-size:15px;margin-top:6px">
+      <option value="1">1 minute</option>
+      <option value="2">2 minutes</option>
+      <option value="5">5 minutes</option>
+      <option value="10">10 minutes</option>
+      <option value="15">15 minutes</option>
+      <option value="30">30 minutes</option>
+    </select>
+    <p id="aisIntMsg" class="hint">Vaut pour tous les bateaux suivis par AIS. Plus l'intervalle est court, plus la trace est fine — et plus le quota de stockage est consommé.</p>
+    <p class="hint">Portée : réseau de stations côtières. Un AIS classe B (2 W) porte 8–10 milles — parfait près des côtes, inopérant au large.</p>
+  </div>
 </div>
 <script>
 "use strict";
 var fid=new URLSearchParams(location.search).get('fleet');
 var $=function(i){return document.getElementById(i);};
-if(!fid){$('sub').textContent='Lien de flotte invalide ou manquant.';$('form').style.display='none';}
+if(!fid){$('sub').textContent='Lien de flotte invalide ou manquant.';$('form').style.display='none';$('aisBox').style.display='none';}
+$('aisGo').onclick=function(){
+  var nm=$('aisName').value.trim(), mm=$('aisMmsi').value.replace(/[^0-9]/g,'');
+  if(mm.length!==9){$('aisMsg').style.color='#e6584c';$('aisMsg').textContent='Le MMSI doit comporter 9 chiffres.';return;}
+  $('aisMsg').style.color='';$('aisMsg').textContent='…';$('aisGo').disabled=true;
+  fetch('/api/fleets/'+fid+'/mmsi',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name:nm,mmsi:mm})})
+   .then(function(r){return r.json();}).then(function(d){
+     $('aisGo').disabled=false;
+     if(d.error){$('aisMsg').style.color='#e6584c';$('aisMsg').textContent=d.error;return;}
+     $('aisMsg').style.color='#37c871';
+     $('aisMsg').textContent=(d.already?'Déjà suivi — ajouté à la flotte.':'Ajouté. Il apparaîtra dès qu\\u2019une station AIS captera son signal.');
+     $('aisName').value='';$('aisMmsi').value='';
+   }).catch(function(){$('aisGo').disabled=false;$('aisMsg').style.color='#e6584c';$('aisMsg').textContent='Erreur réseau, réessaie.';});
+};
+fetch('/api/settings').then(function(r){return r.json();}).then(function(d){
+  if(d&&d.aisIntervalMin)$('aisInt').value=String(d.aisIntervalMin);
+}).catch(function(){});
+$('aisInt').onchange=function(){
+  var v=this.value;
+  $('aisIntMsg').style.color='';$('aisIntMsg').textContent='Enregistrement…';
+  fetch('/api/settings',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({aisIntervalMin:parseInt(v,10)})})
+   .then(function(r){return r.json();}).then(function(d){
+     if(d.error){$('aisIntMsg').style.color='#e6584c';$('aisIntMsg').textContent=d.error;return;}
+     $('aisIntMsg').style.color='#37c871';$('aisIntMsg').textContent='Réglé sur 1 point toutes les '+d.aisIntervalMin+' min.';
+   }).catch(function(){$('aisIntMsg').style.color='#e6584c';$('aisIntMsg').textContent='Erreur réseau.';});
+};
 $('go').onclick=function(){
   var name=$('boat').value.trim();
   if(!name){$('err').textContent='Indique un nom de bateau.';return;}
@@ -1350,6 +1405,35 @@ const server = http.createServer(async (req, res) => {
       if (!/^[a-f0-9]{16}$/.test(tid)) return json(res, 400, { error: 'trackId invalide' });
       await store.fleetRemove(mFleetRemove[1], tid);
       return json(res, 200, { ok: true });
+    }
+    if (p === '/api/settings' && req.method === 'GET') {
+      return json(res, 200, { aisIntervalMin: Math.round(aisIntervalMs / 60000), aisEnabled: !!AIS_KEY, aisDefaultMin: AIS_DEFAULT_MIN });
+    }
+    if (p === '/api/settings' && req.method === 'POST') {
+      let body; try { body = await readBody(req); } catch { return json(res, 400, { error: 'json' }); }
+      const m = num(parseInt(body.aisIntervalMin, 10));
+      if (m === null || m < 1 || m > 60) return json(res, 400, { error: 'Intervalle attendu entre 1 et 60 minutes' });
+      aisIntervalMs = m * 60000;
+      await store.cfgSet({ aisIntervalMin: m });
+      return json(res, 200, { aisIntervalMin: m });
+    }
+    const mFleetMmsi = p.match(/^\/api\/fleets\/([a-f0-9]{16})\/mmsi$/);
+    if (mFleetMmsi && req.method === 'POST') {
+      const fid = mFleetMmsi[1];
+      const fleet = await store.fleetGet(fid); if (!fleet) return json(res, 404, { error: 'flotte introuvable' });
+      let body; try { body = await readBody(req); } catch { return json(res, 400, { error: 'json' }); }
+      const mmsi = String(body.mmsi || '').replace(/[^0-9]/g, '');
+      if (!/^[0-9]{9}$/.test(mmsi)) return json(res, 400, { error: 'MMSI invalide (9 chiffres attendus)' });
+      if (!AIS_KEY) return json(res, 503, { error: 'Suivi AIS non configure sur ce serveur (AIS_API_KEY manquante)' });
+      const known = await store.mmsiAll();
+      if (known && known[mmsi]) { await store.fleetAdd(fid, known[mmsi]); await aisRefresh(true); return json(res, 200, { id: known[mmsi], mmsi, already: true }); }
+      const id = id16(), publishKey = key24();
+      const meta = { id, name: (body.name || ('MMSI ' + mmsi)).toString().slice(0, 80), keyHash: sha(publishKey), createdAt: Date.now(), fleets: [fid], mmsi: mmsi };
+      await store.create(meta);
+      await store.fleetAdd(fid, id);
+      await store.mmsiSet(mmsi, id);
+      await aisRefresh(true);
+      return json(res, 201, { id, mmsi, name: meta.name });
     }
     const mFleetJoin = p.match(/^\/api\/fleets\/([a-f0-9]{16})\/join$/);
     const mFleet = p.match(/^\/api\/fleets\/([a-f0-9]{16})$/);
@@ -1471,4 +1555,70 @@ const server = http.createServer(async (req, res) => {
   res.writeHead(404, { 'Content-Type': 'text/plain' }); res.end('404');
 });
 
-server.listen(PORT, () => console.log('Sea Tracker (' + (USE_REDIS ? 'Upstash Redis' : 'fichiers') + ') sur http://localhost:' + PORT));
+/* ---- Ingestion AIS (aisstream.io) : bateaux suivis par MMSI ---- */
+const AIS_KEY = process.env.AIS_API_KEY || '';
+const AIS_DEFAULT_MIN = 5;
+let aisIntervalMs = AIS_DEFAULT_MIN * 60000;
+let aisMap = {};
+const aisLast = new Map();
+let aisWs = null, aisRetry = 0, aisTimer = null;
+
+async function aisHandle(raw) {
+  let m; try { m = JSON.parse(typeof raw === 'string' ? raw : String(raw)); } catch { return; }
+  if (!m || m.MessageType !== 'PositionReport') return;
+  const md = m.MetaData || {};
+  const pr = (m.Message && m.Message.PositionReport) || {};
+  const mmsi = String(md.MMSI || pr.UserID || '');
+  const tid = aisMap[mmsi];
+  if (!tid) return;
+  const now = Date.now();
+  if (now - (aisLast.get(mmsi) || 0) < aisIntervalMs) return;
+  const lat = num(pr.Latitude != null ? pr.Latitude : md.latitude);
+  const lon = num(pr.Longitude != null ? pr.Longitude : md.longitude);
+  if (lat === null || lon === null || Math.abs(lat) > 90 || Math.abs(lon) > 180) return;
+  aisLast.set(mmsi, now);
+  let t = now;
+  if (md.time_utc) { const d = Date.parse(String(md.time_utc).replace(' +0000 UTC', 'Z').replace(' ', 'T')); if (!isNaN(d)) t = d; }
+  const sog = num(pr.Sog), cog = num(pr.Cog);
+  const pt = [r6(lat), r6(lon), Math.round(t), (sog === null || sog >= 102.3) ? null : Math.round(sog * 10) / 10, (cog === null || cog >= 360) ? null : Math.round(cog)];
+  try {
+    const meta = await store.getMeta(tid);
+    await store.append(tid, [pt]);
+    broadcast(tid, pt);
+    if (meta && meta.fleets) for (const fid of meta.fleets) broadcastFleet(fid, { b: tid, n: meta.name, p: pt });
+  } catch {}
+}
+function aisReconnect() {
+  if (!AIS_KEY) return;
+  aisRetry = Math.min(aisRetry + 1, 6);
+  if (aisTimer) clearTimeout(aisTimer);
+  aisTimer = setTimeout(aisConnect, Math.min(60000, 2000 * Math.pow(2, aisRetry - 1)));
+}
+function aisConnect() {
+  if (!AIS_KEY || typeof WebSocket !== 'function') return;
+  if (aisTimer) { clearTimeout(aisTimer); aisTimer = null; }
+  if (aisWs) { try { aisWs.onclose = null; aisWs.close(); } catch {} aisWs = null; }
+  const list = Object.keys(aisMap).slice(0, 50);
+  if (!list.length) return;
+  let ws;
+  try { ws = new WebSocket('wss://stream.aisstream.io/v0/stream'); } catch { return aisReconnect(); }
+  aisWs = ws;
+  ws.onopen = () => {
+    aisRetry = 0;
+    const sub = { APIKey: AIS_KEY, Apikey: AIS_KEY, BoundingBoxes: [[[-90, -180], [90, 180]]], FiltersShipMMSI: list, FilterMessageTypes: ['PositionReport'] };
+    try { ws.send(JSON.stringify(sub)); } catch {}
+    console.log('AIS: abonnement a ' + list.length + ' MMSI');
+  };
+  ws.onmessage = (ev) => { aisHandle(ev.data); };
+  ws.onerror = () => {};
+  ws.onclose = () => { if (aisWs === ws) { aisWs = null; aisReconnect(); } };
+}
+async function aisRefresh(reconnect) {
+  try { aisMap = (await store.mmsiAll()) || {}; } catch { aisMap = {}; }
+  if (reconnect) aisConnect();
+}
+async function aisLoadCfg() {
+  try { const c = await store.cfgGet(); const m = num(c && c.aisIntervalMin); if (m !== null && m >= 1 && m <= 60) aisIntervalMs = Math.round(m) * 60000; } catch {}
+}
+
+server.listen(PORT, () => { console.log('Sea Tracker (' + (USE_REDIS ? 'Upstash Redis' : 'fichiers') + ') sur http://localhost:' + PORT); aisLoadCfg().then(() => { if (AIS_KEY) aisRefresh(true); }); });
