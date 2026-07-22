@@ -1389,6 +1389,11 @@ $('aisGo').onclick=function(){
 };
 fetch('/api/fleets/'+fid+'/settings').then(function(r){return r.json();}).then(function(d){
   if(d&&d.aisIntervalMin)$('aisInt').value=String(d.aisIntervalMin);
+  if(d&&d.aisEnabled===false){
+    $('aisGo').disabled=true;
+    $('aisInt').disabled=true;
+    $('aisMsg').textContent='Suivi AIS inactif : une clé aisstream.io (gratuite) doit être ajoutée dans AIS_API_KEY sur le serveur.';
+  }
 }).catch(function(){});
 $('aisInt').onchange=function(){
   var v=this.value;
@@ -1631,11 +1636,15 @@ function loadBoats(fid){
           +'<span class="x" data-rm="'+fid+'|'+x.id+'|'+esc(x.name)+'">✕</span></div>';
       }).join('');
     }
+    box.innerHTML+='<div class="lbl" style="margin-top:12px">Ajouter un bateau par AIS (MMSI)</div>';
     if(AIS){
-      box.innerHTML+='<div class="lbl" style="margin-top:12px">Ajouter un bateau par AIS</div>'
-        +'<input data-mn="'+fid+'" placeholder="Nom du bateau" maxlength="40">'
+      box.innerHTML+='<input data-mn="'+fid+'" placeholder="Nom du bateau" maxlength="40">'
         +'<input data-mm="'+fid+'" placeholder="MMSI (9 chiffres)" inputmode="numeric" maxlength="9" style="margin-top:6px">'
         +'<button class="sec" data-madd="'+fid+'">Ajouter par MMSI</button>';
+    } else {
+      box.innerHTML+='<p class="sub" style="margin:4px 0 0">Suivi AIS inactif : il faut une clé <b>aisstream.io</b> (gratuite) '
+        +'ajoutée dans la variable <code>AIS_API_KEY</code> sur le serveur. Tant qu\\'elle manque, les bateaux ne peuvent être suivis '
+        +'que par l\\'application Traccar (lien d\\'invitation).</p>';
     }
     box.querySelectorAll('[data-rm]').forEach(function(s){s.onclick=function(){
       var parts=this.getAttribute('data-rm').split('|');
