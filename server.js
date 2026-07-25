@@ -24,6 +24,16 @@ const key24 = () => crypto.randomBytes(12).toString('hex');
 const sha = (s) => crypto.createHash('sha256').update(String(s)).digest('hex');
 const num = (v) => (typeof v === 'number' && isFinite(v)) ? v : null;
 const r6 = (v) => Math.round(v * 1e6) / 1e6;
+/* dedoublonne une liste en conservant l'ordre d'origine */
+const dedup = (a) => { const vu = Object.create(null), out = []; for (const x of (a || [])) { if (vu[x]) continue; vu[x] = 1; out.push(x); } return out; };
+/* reduit une trace a `max` points en gardant le premier et le dernier */
+function decime(pts, max) {
+  if (!max || !pts || pts.length <= max || max < 2) return pts || [];
+  const out = [], pas = (pts.length - 1) / (max - 1);
+  for (let i = 0; i < max - 1; i++) out.push(pts[Math.round(i * pas)]);
+  out.push(pts[pts.length - 1]);
+  return out;
+}
 
 /* ---- import de listes de MMSI (txt / csv / xlsx) ---- */
 function xmlDec(t) {
@@ -254,7 +264,8 @@ const fileStore = {
   fleetCreate: async (m) => { const f = Object.assign({ members: [] }, m); fleetCache.set(m.id, f); fs.writeFileSync(fltPath(m.id), JSON.stringify(f)); },
   fleetGet: async (fid) => { const f = fleetLoad(fid); return f ? { id: f.id, name: f.name, createdAt: f.createdAt, aisIntervalMin: f.aisIntervalMin } : null; },
   fleetAdd: async (fid, tid) => { const f = fleetLoad(fid); if (!f) return; if (f.members.indexOf(tid) < 0) { f.members.push(tid); fs.writeFileSync(fltPath(fid), JSON.stringify(f)); } },
-  fleetMembers: async (fid) => { const f = fleetLoad(fid); return f ? f.members : []; },
+  fleetMembers: async (fid) => { const f = fleetLoad(fid); return f ? dedup(f.members) : []; },
+  boatDelete: async (id) => { fileCache.delete(id); try { fs.unlinkSync(fpath(id)); } catch {} },
   fleetRemove: async (fid, tid) => { const f = fleetLoad(fid); if (!f) return; f.members = f.members.filter((x) => x !== tid); fs.writeFileSync(fltPath(fid), JSON.stringify(f)); },
   devSet: async (kh, tid) => { let d = {}; try { d = JSON.parse(fs.readFileSync(path.join(DATA, 'devices.json'), 'utf8')); } catch {} d[kh] = tid; fs.writeFileSync(path.join(DATA, 'devices.json'), JSON.stringify(d)); },
   devGet: async (kh) => { try { const d = JSON.parse(fs.readFileSync(path.join(DATA, 'devices.json'), 'utf8')); return d[kh] || null; } catch { return null; } },
@@ -273,6 +284,7 @@ const rPts = (id) => 'st:' + id + ':pts';
 const rFlt = (id) => 'flt:' + id + ':meta';
 const rFltM = (id) => 'flt:' + id + ':members';
 let stockErreurs = 0, stockDerniereErreur = '';
+let apiErreurs = 0, apiDerniereErreur = '', apiDerniereErreurAt = 0;
 async function redisCmd(cmd) {
   const res = await fetch(process.env.UPSTASH_REDIS_REST_URL, {
     method: 'POST',
@@ -292,8 +304,9 @@ const redisStore = {
   lastPoint: async (id) => { const v = await redisCmd(['LINDEX', rPts(id), '-1']); return v ? JSON.parse(v) : null; },
   fleetCreate: async (m) => { await redisCmd(['SET', rFlt(m.id), JSON.stringify(m)]); },
   fleetGet: async (fid) => { const s = await redisCmd(['GET', rFlt(fid)]); return s ? JSON.parse(s) : null; },
-  fleetAdd: async (fid, tid) => { await redisCmd(['RPUSH', rFltM(fid), tid]); },
-  fleetMembers: async (fid) => { const a = await redisCmd(['LRANGE', rFltM(fid), '0', '-1']); return a || []; },
+  fleetAdd: async (fid, tid) => { const a = await redisCmd(['LRANGE', rFltM(fid), '0', '-1']); if ((a || []).indexOf(tid) >= 0) return; await redisCmd(['RPUSH', rFltM(fid), tid]); },
+  fleetMembers: async (fid) => { const a = await redisCmd(['LRANGE', rFltM(fid), '0', '-1']); return dedup(a || []); },
+  boatDelete: async (id) => { await redisCmd(['DEL', rMeta(id)]); await redisCmd(['DEL', rPts(id)]); },
   fleetRemove: async (fid, tid) => { await redisCmd(['LREM', rFltM(fid), '0', tid]); },
   devSet: async (kh, tid) => { await redisCmd(['SET', 'dev:' + kh, tid]); },
   devGet: async (kh) => { return await redisCmd(['GET', 'dev:' + kh]); },
@@ -306,6 +319,47 @@ const redisStore = {
   fleetDelete: async (fid) => { await redisCmd(['SREM', 'flts', fid]); await redisCmd(['DEL', rFlt(fid)]); await redisCmd(['DEL', rFltM(fid)]); }
 };
 const store = USE_REDIS ? redisStore : fileStore;
+
+/* ---- appartenance a une flotte : source unique ----
+   L'appartenance est ecrite des deux cotes (liste des membres de la flotte ET
+   meta.fleets du bateau). meta.fleets pilote la diffusion SSE et l'intervalle
+   AIS : les deux doivent rester synchronises, sinon le bateau s'affiche dans la
+   flotte mais n'y emet jamais. */
+async function fleetAttach(fid, tid) {
+  await store.fleetAdd(fid, tid);
+  try {
+    const m = await store.getMeta(tid);
+    if (!m) return false;
+    const f = m.fleets || [];
+    if (f.indexOf(fid) < 0) { f.push(fid); m.fleets = f; await store.setMeta(m); }
+    return true;
+  } catch { return false; }
+}
+async function fleetDetach(fid, tid) {
+  await store.fleetRemove(fid, tid);
+  try {
+    const m = await store.getMeta(tid);
+    if (m && Array.isArray(m.fleets) && m.fleets.indexOf(fid) >= 0) {
+      m.fleets = m.fleets.filter((x) => x !== fid);
+      await store.setMeta(m);
+    }
+  } catch {}
+}
+/* retire la flotte de tous ses membres avant sa suppression */
+async function fleetDetachAll(fid) {
+  let ids = [];
+  try { ids = await store.fleetMembers(fid); } catch {}
+  for (const tid of ids) {
+    try {
+      const m = await store.getMeta(tid);
+      if (m && Array.isArray(m.fleets) && m.fleets.indexOf(fid) >= 0) {
+        m.fleets = m.fleets.filter((x) => x !== fid);
+        await store.setMeta(m);
+      }
+    } catch {}
+  }
+  return ids.length;
+}
 const fleetClients = new Map();
 function broadcastFleet(fid, obj) {
   const set = fleetClients.get(fid); if (!set) return;
@@ -315,10 +369,18 @@ function broadcastFleet(fid, obj) {
 
 const CORS = {
   'Access-Control-Allow-Origin': '*',
-  'Access-Control-Allow-Methods': 'GET,POST,OPTIONS',
-  'Access-Control-Allow-Headers': 'Content-Type,x-publish-key'
+  'Access-Control-Allow-Methods': 'GET,POST,DELETE,OPTIONS',
+  'Access-Control-Allow-Headers': 'Content-Type,x-publish-key,x-admin-key'
 };
 function json(res, code, obj) { res.writeHead(code, Object.assign({ 'Content-Type': 'application/json', 'Cache-Control': 'no-store, no-cache, must-revalidate', 'Pragma': 'no-cache' }, CORS)); res.end(JSON.stringify(obj)); }
+/* clé de gestion : toute écriture qui consomme du quota AIS ou modifie la
+   composition d'une flotte doit la présenter (en-tête x-admin-key ou ?k=). */
+const ERR_GESTION = { error: 'Réservé à la console : clé de gestion requise.' };
+function adminOk(req, u) {
+  if (!ADMIN_KEY) return false;
+  const k = req.headers['x-admin-key'] || u.searchParams.get('k') || '';
+  return k === ADMIN_KEY;
+}
 function readBody(req) {
   return new Promise((resolve, reject) => {
     let b = ''; let n = 0;
@@ -564,6 +626,7 @@ const PAGE_VIEWER = `<!DOCTYPE html>
 <script src="https://unpkg.com/maplibre-gl/dist/maplibre-gl.js"></script>
 <script src="https://unpkg.com/@maplibre/maplibre-gl-leaflet/leaflet-maplibre-gl.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/leaflet-velocity@2.1.4/dist/leaflet-velocity.min.js"></script>
+<script src="/carte.js"></script>
 <script>
 "use strict";
 var id = new URL(location.href).searchParams.get('id');
@@ -588,21 +651,7 @@ function gcInterp(a,b,f){var d=angDist(a,b);if(d<1e-9)return{lat:a.lat,lon:a.lon
 var map=L.map('map',{zoomControl:true,worldCopyJump:true,maxZoom:18}).setView([46,-20],4);
 map.createPane('windPane');map.getPane('windPane').style.zIndex=550;map.getPane('windPane').style.pointerEvents='none';
 
-/* ---- attributions compactes, sans doublon, dépliables au tap ---- */
-if(map.attributionControl)map.attributionControl.setPrefix('');
-function tidyAttrib(){
-  var el=document.querySelector('.leaflet-control-attribution');
-  if(!el)return;
-  var seen={},out=[];
-  el.innerHTML.split(/\\s*(?:\\||,)\\s*/).forEach(function(p){
-    var k=p.replace(/<[^>]*>/g,'').replace(/\\s+/g,' ').trim();
-    if(k&&!seen[k]){seen[k]=1;out.push(p.trim());}
-  });
-  el.innerHTML=out.join(' · ');
-  if(!el.dataset.tap){el.dataset.tap='1';el.onclick=function(){this.classList.toggle('exp');};}
-}
-map.on('layeradd layerremove baselayerchange overlayadd overlayremove',function(){setTimeout(tidyAttrib,60);});
-setTimeout(tidyAttrib,600);
+installAttrib(map);
 
 // Fonds de carte
 var esriOcean=L.tileLayer('https://server.arcgisonline.com/ArcGIS/rest/services/Ocean/World_Ocean_Base/MapServer/tile/{z}/{y}/{x}',{maxNativeZoom:13,maxZoom:18,attribution:'Fond océan &copy; Esri'});
@@ -642,90 +691,14 @@ bases['OpenStreetMap']=osm;
 var windGroup=L.layerGroup();
 var overlays=Object.assign({'Balises (OpenSeaMap)':seamark,'Balises SHOM':shomBalise,'Vent animé (Open‑Meteo)':windGroup},weather);
 /* ---- menu des calques (maison : ouverture au tap, indépendant de Leaflet) ---- */
-function buildLayerMenu(map, bases, overlays){
-  var btn=document.createElement('button');
-  btn.type='button'; btn.className='lyrbtn'; btn.setAttribute('aria-label','Calques'); btn.textContent='\\u2261';
-  var panel=document.createElement('div'); panel.className='lyrpanel';
-  var hB=document.createElement('div'); hB.className='grp'; hB.textContent='Fond de carte';
-  var boxB=document.createElement('div');
-  var hO=document.createElement('div'); hO.className='grp'; hO.textContent='Calques';
-  var boxO=document.createElement('div');
-  panel.appendChild(hB); panel.appendChild(boxB); panel.appendChild(hO); panel.appendChild(boxO);
-  document.body.appendChild(btn); document.body.appendChild(panel);
-  var current=null;
-  function addBase(name, layer){
-    var lab=document.createElement('label');
-    var inp=document.createElement('input'); inp.type='radio'; inp.name='lyrbase';
-    if(map.hasLayer(layer)){ inp.checked=true; current=layer; }
-    var sp=document.createElement('span'); sp.textContent=name;
-    lab.appendChild(inp); lab.appendChild(sp); boxB.appendChild(lab);
-    inp.onchange=function(){
-      if(!this.checked)return;
-      if(current&&current!==layer&&map.hasLayer(current))map.removeLayer(current);
-      current=layer;
-      if(!map.hasLayer(layer))map.addLayer(layer);
-      if(layer.bringToBack){try{layer.bringToBack();}catch(e){}}
-      map.fire('baselayerchange',{layer:layer,name:name});
-    };
-  }
-  function addOverlay(layer, name){
-    var lab=document.createElement('label');
-    var inp=document.createElement('input'); inp.type='checkbox'; inp.checked=map.hasLayer(layer);
-    var sp=document.createElement('span'); sp.textContent=name;
-    lab.appendChild(inp); lab.appendChild(sp); boxO.appendChild(lab);
-    inp.onchange=function(){
-      if(this.checked){ if(!map.hasLayer(layer))map.addLayer(layer); map.fire('overlayadd',{layer:layer,name:name}); }
-      else { if(map.hasLayer(layer))map.removeLayer(layer); map.fire('overlayremove',{layer:layer,name:name}); }
-    };
-  }
-  for(var b in bases) addBase(b, bases[b]);
-  for(var o in overlays) addOverlay(overlays[o], o);
-  btn.onclick=function(e){ e.stopPropagation(); panel.classList.toggle('open'); };
-  panel.addEventListener('click',function(e){ e.stopPropagation(); });
-  document.addEventListener('click',function(){ panel.classList.remove('open'); });
-  return { addOverlay:addOverlay, panel:panel, button:btn };
-}
-var layerCtl;
-try { layerCtl = buildLayerMenu(map, bases, overlays); }
-catch(e){
-  try{
-    var secours=L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png',{maxZoom:18,attribution:'&copy; OpenStreetMap'});
-    secours.addTo(map);
-    layerCtl={addOverlay:function(){},panel:null,button:null};
-  }catch(e2){}
-}
-if(!map._loaded || !Object.keys(bases).length){ try{ L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png',{maxZoom:18}).addTo(map); }catch(e){} }
+var layerCtl = installLayerMenu(map, bases, overlays);
 // Vent animé (particules) via leaflet-velocity + Open-Meteo
-var MODELS=[{v:'best_match',t:'Auto (best match)'},{v:'meteofrance_arome_france_hd',t:'AROME France HD 1.5 km'},{v:'meteofrance_arpege_europe',t:'ARPEGE Europe 11 km'},{v:'icon_eu',t:'ICON-EU 7 km'},{v:'ecmwf_ifs025',t:'ECMWF 25 km'},{v:'gfs_seamless',t:'GFS 25 km'}];
-var HOURS=[{v:0,t:'Maintenant'},{v:6,t:'+6 h'},{v:12,t:'+12 h'},{v:24,t:'+24 h'},{v:48,t:'+48 h'}];
-function fillSel(sel,list,def){list.forEach(function(o){var e=document.createElement('option');e.value=o.v;e.textContent=o.t;if(String(o.v)===String(def))e.selected=true;sel.appendChild(e);});}
 fillSel(document.getElementById('windModel'),MODELS,'best_match');
 fillSel(document.getElementById('windHour'),HOURS,0);
 fillSel(document.getElementById('fcModel'),MODELS,'best_match');
 
-var windLayer=null, windBusy=false;
-function windOpts(d){return {displayValues:true,
-  displayOptions:{velocityType:'Vent',position:'bottomleft',emptyString:'—',angleConvention:'bearingCW',speedUnit:'kt'},
-  data:d, minVelocity:0, maxVelocity:18, velocityScale:0.014, opacity:1,
-  lineWidth:2.4, particleAge:110, particleMultiplier:1/170, paneName:'windPane',
-  colorScale:['#3a4cff','#0091ff','#00c2ff','#00e0a0','#61ff3d','#d4ff00','#ffd000','#ff8a00','#ff3b2f','#ff0a78']};}
-function loadWind(){
-  if(!L.velocityLayer)return; windBusy=true;
-  var c=map.getCenter();
-  var model=document.getElementById('windModel').value, hour=document.getElementById('windHour').value;
-  fetch('/api/wind?lat='+c.lat.toFixed(2)+'&lon='+c.lng.toFixed(2)+'&model='+encodeURIComponent(model)+'&hour='+hour)
-   .then(function(r){return r.json();}).then(function(d){
-     windBusy=false;
-     if(windLayer){windGroup.removeLayer(windLayer);windLayer=null;}
-     windLayer=L.velocityLayer(windOpts(d)); windGroup.addLayer(windLayer);
-   }).catch(function(){windBusy=false;});
-}
-map.on('overlayadd', function(e){ if(e.layer!==windGroup)return; document.getElementById('windCtl').style.display='block'; if(!windLayer&&!windBusy)loadWind(); });
-map.on('overlayremove', function(e){ if(e.layer!==windGroup)return; document.getElementById('windCtl').style.display='none'; if(windLayer){windGroup.removeLayer(windLayer);windLayer=null;} });
-document.getElementById('windModel').onchange=function(){ if(map.hasLayer(windGroup))loadWind(); };
-document.getElementById('windHour').onchange=function(){ if(map.hasLayer(windGroup))loadWind(); };
+initVent(map, windGroup);
 
-function dirArrow(deg){var a=['↓','↙','←','↖','↑','↗','→','↘'];return a[Math.round(((deg||0)%360)/45)%8];}
 function loadForecast(){
   var body=document.getElementById('fcBody');
   var last=pts.length?pts[pts.length-1]:null,lat,lon;
@@ -773,14 +746,7 @@ map.on('click', function(e){
   }).catch(function(){pop.setContent('Erreur de chargement');});
 });
 // Radar pluie RainViewer (sans clé)
-fetch('https://api.rainviewer.com/public/weather-maps.json').then(function(r){return r.json();}).then(function(d){
-  if(d&&d.radar&&d.radar.past&&d.radar.past.length){
-    var f=d.radar.past[d.radar.past.length-1];
-    var radar=L.tileLayer((d.host||'https://tilecache.rainviewer.com')+f.path+'/256/{z}/{x}/{y}/2/1_1.png',
-      {opacity:0.6,maxZoom:12,attribution:'Radar &copy; RainViewer'});
-    layerCtl.addOverlay(radar,'Radar pluie');
-  }
-}).catch(function(){});
+installRadar(layerCtl);
 
 var trace=L.polyline([],{color:'#f5a623',weight:3.5,opacity:.95}).addTo(map);
 var startMk=null;
@@ -1244,6 +1210,134 @@ function windyFillLayers(sel, def) {
   });
 }
 `;
+const PAGE_CARTEJS = `/* Sea Tracker — briques de carte communes au suivi solo (/v) et a la flotte (/vf).
+   Source unique : toute correction ici vaut pour les deux pages.
+   Les fonds de carte restent definis dans chaque page, leurs reglages de zoom
+   differant volontairement. */
+"use strict";
+
+/* attributions compactes, sans doublon, depliables au tap */
+function tidyAttrib(){
+  var el=document.querySelector('.leaflet-control-attribution');
+  if(!el)return;
+  var seen={},out=[];
+  el.innerHTML.split(/\\s*(?:\\||,)\\s*/).forEach(function(p){
+    var k=p.replace(/<[^>]*>/g,'').replace(/\\s+/g,' ').trim();
+    if(k&&!seen[k]){seen[k]=1;out.push(p.trim());}
+  });
+  el.innerHTML=out.join(' · ');
+  if(!el.dataset.tap){el.dataset.tap='1';el.onclick=function(){this.classList.toggle('exp');};}
+}
+function installAttrib(map){
+  if(map.attributionControl)map.attributionControl.setPrefix('');
+  map.on('layeradd layerremove baselayerchange overlayadd overlayremove',function(){setTimeout(tidyAttrib,60);});
+  setTimeout(tidyAttrib,600);
+}
+
+/* menu de calques */
+function buildLayerMenu(map, bases, overlays){
+  var btn=document.createElement('button');
+  btn.type='button'; btn.className='lyrbtn'; btn.setAttribute('aria-label','Calques'); btn.textContent='\\u2261';
+  var panel=document.createElement('div'); panel.className='lyrpanel';
+  var hB=document.createElement('div'); hB.className='grp'; hB.textContent='Fond de carte';
+  var boxB=document.createElement('div');
+  var hO=document.createElement('div'); hO.className='grp'; hO.textContent='Calques';
+  var boxO=document.createElement('div');
+  panel.appendChild(hB); panel.appendChild(boxB); panel.appendChild(hO); panel.appendChild(boxO);
+  document.body.appendChild(btn); document.body.appendChild(panel);
+  var current=null;
+  function addBase(name, layer){
+    var lab=document.createElement('label');
+    var inp=document.createElement('input'); inp.type='radio'; inp.name='lyrbase';
+    if(map.hasLayer(layer)){ inp.checked=true; current=layer; }
+    var sp=document.createElement('span'); sp.textContent=name;
+    lab.appendChild(inp); lab.appendChild(sp); boxB.appendChild(lab);
+    inp.onchange=function(){
+      if(!this.checked)return;
+      if(current&&current!==layer&&map.hasLayer(current))map.removeLayer(current);
+      current=layer;
+      if(!map.hasLayer(layer))map.addLayer(layer);
+      if(layer.bringToBack){try{layer.bringToBack();}catch(e){}}
+      map.fire('baselayerchange',{layer:layer,name:name});
+    };
+  }
+  function addOverlay(layer, name){
+    var lab=document.createElement('label');
+    var inp=document.createElement('input'); inp.type='checkbox'; inp.checked=map.hasLayer(layer);
+    var sp=document.createElement('span'); sp.textContent=name;
+    lab.appendChild(inp); lab.appendChild(sp); boxO.appendChild(lab);
+    inp.onchange=function(){
+      if(this.checked){ if(!map.hasLayer(layer))map.addLayer(layer); map.fire('overlayadd',{layer:layer,name:name}); }
+      else { if(map.hasLayer(layer))map.removeLayer(layer); map.fire('overlayremove',{layer:layer,name:name}); }
+    };
+  }
+  for(var b in bases) addBase(b, bases[b]);
+  for(var o in overlays) addOverlay(overlays[o], o);
+  btn.onclick=function(e){ e.stopPropagation(); panel.classList.toggle('open'); };
+  panel.addEventListener('click',function(e){ e.stopPropagation(); });
+  document.addEventListener('click',function(){ panel.classList.remove('open'); });
+  return { addOverlay:addOverlay, panel:panel, button:btn };
+}
+function installLayerMenu(map, bases, overlays){
+  var layerCtl;
+try { layerCtl = buildLayerMenu(map, bases, overlays); }
+catch(e){
+  try{
+    var secours=L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png',{maxZoom:18,attribution:'&copy; OpenStreetMap'});
+    secours.addTo(map);
+    layerCtl={addOverlay:function(){},panel:null,button:null};
+  }catch(e2){}
+}
+if(!map._loaded || !Object.keys(bases).length){ try{ L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png',{maxZoom:18}).addTo(map); }catch(e){} }
+  return layerCtl;
+}
+
+/* modeles et echeances meteo */
+var MODELS=[{v:'best_match',t:'Auto (best match)'},{v:'meteofrance_arome_france_hd',t:'AROME France HD 1.5 km'},{v:'meteofrance_arpege_europe',t:'ARPEGE Europe 11 km'},{v:'icon_eu',t:'ICON-EU 7 km'},{v:'ecmwf_ifs025',t:'ECMWF 25 km'},{v:'gfs_seamless',t:'GFS 25 km'}];
+var HOURS=[{v:0,t:'Maintenant'},{v:6,t:'+6 h'},{v:12,t:'+12 h'},{v:24,t:'+24 h'},{v:48,t:'+48 h'}];
+function fillSel(sel,list,def){list.forEach(function(o){var e=document.createElement('option');e.value=o.v;e.textContent=o.t;if(String(o.v)===String(def))e.selected=true;sel.appendChild(e);});}
+
+/* vent anime (particules) via leaflet-velocity + Open-Meteo */
+function initVent(map, windGroup){
+var windLayer=null, windBusy=false;
+function windOpts(d){return {displayValues:true,
+  displayOptions:{velocityType:'Vent',position:'bottomleft',emptyString:'—',angleConvention:'bearingCW',speedUnit:'kt'},
+  data:d, minVelocity:0, maxVelocity:18, velocityScale:0.014, opacity:1,
+  lineWidth:2.4, particleAge:110, particleMultiplier:1/170, paneName:'windPane',
+  colorScale:['#3a4cff','#0091ff','#00c2ff','#00e0a0','#61ff3d','#d4ff00','#ffd000','#ff8a00','#ff3b2f','#ff0a78']};}
+function loadWind(){
+  if(!L.velocityLayer)return; windBusy=true;
+  var c=map.getCenter();
+  var model=document.getElementById('windModel').value, hour=document.getElementById('windHour').value;
+  fetch('/api/wind?lat='+c.lat.toFixed(2)+'&lon='+c.lng.toFixed(2)+'&model='+encodeURIComponent(model)+'&hour='+hour)
+   .then(function(r){return r.json();}).then(function(d){
+     windBusy=false;
+     if(windLayer){windGroup.removeLayer(windLayer);windLayer=null;}
+     windLayer=L.velocityLayer(windOpts(d)); windGroup.addLayer(windLayer);
+   }).catch(function(){windBusy=false;});
+}
+map.on('overlayadd', function(e){ if(e.layer!==windGroup)return; document.getElementById('windCtl').style.display='block'; if(!windLayer&&!windBusy)loadWind(); });
+map.on('overlayremove', function(e){ if(e.layer!==windGroup)return; document.getElementById('windCtl').style.display='none'; if(windLayer){windGroup.removeLayer(windLayer);windLayer=null;} });
+document.getElementById('windModel').onchange=function(){ if(map.hasLayer(windGroup))loadWind(); };
+document.getElementById('windHour').onchange=function(){ if(map.hasLayer(windGroup))loadWind(); };
+  return loadWind;
+}
+
+/* radar de pluie RainViewer */
+function installRadar(layerCtl){
+fetch('https://api.rainviewer.com/public/weather-maps.json').then(function(r){return r.json();}).then(function(d){
+  if(d&&d.radar&&d.radar.past&&d.radar.past.length){
+    var f=d.radar.past[d.radar.past.length-1];
+    var radar=L.tileLayer((d.host||'https://tilecache.rainviewer.com')+f.path+'/256/{z}/{x}/{y}/2/1_1.png',
+      {opacity:0.6,maxZoom:12,attribution:'Radar &copy; RainViewer'});
+    layerCtl.addOverlay(radar,'Radar pluie');
+  }
+}).catch(function(){});
+}
+
+/* fleche compacte indiquant la direction vers laquelle porte un vecteur */
+function dirArrow(deg){if(deg==null)return '';var a=['\u2193','\u2199','\u2190','\u2196','\u2191','\u2197','\u2192','\u2198'];return a[Math.round((((deg%360)+360)%360)/45)%8];}
+`;
 const PAGE_FLEET = `<!DOCTYPE html>
 <html lang="fr">
 <head><link rel="manifest" href="__MANIFEST__"><meta name="apple-mobile-web-app-capable" content="yes"><meta name="mobile-web-app-capable" content="yes"><meta name="apple-mobile-web-app-status-bar-style" content="black-translucent"><meta name="apple-mobile-web-app-title" content="Sea Tracker"><meta name="theme-color" content="#0a1a26"><link rel="apple-touch-icon" href="/icon-180.png"><link rel="icon" href="/icon-192.png"><script>if("serviceWorker" in navigator)window.addEventListener("load",function(){navigator.serviceWorker.register("/sw.js").catch(function(){});});</script>
@@ -1321,6 +1415,7 @@ const PAGE_FLEET = `<!DOCTYPE html>
 <script src="https://unpkg.com/maplibre-gl/dist/maplibre-gl.js"></script>
 <script src="https://unpkg.com/@maplibre/maplibre-gl-leaflet/leaflet-maplibre-gl.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/leaflet-velocity@2.1.4/dist/leaflet-velocity.min.js"></script>
+<script src="/carte.js"></script>
 <script src="/config.js"></script>
 <script>
 "use strict";
@@ -1366,21 +1461,7 @@ if(ADMK){
 var map=L.map('map',{zoomControl:true,worldCopyJump:true}).setView([47,-5],6);
 map.createPane('windPane');map.getPane('windPane').style.zIndex=550;map.getPane('windPane').style.pointerEvents='none';
 
-/* ---- attributions compactes, sans doublon, dépliables au tap ---- */
-if(map.attributionControl)map.attributionControl.setPrefix('');
-function tidyAttrib(){
-  var el=document.querySelector('.leaflet-control-attribution');
-  if(!el)return;
-  var seen={},out=[];
-  el.innerHTML.split(/\\s*(?:\\||,)\\s*/).forEach(function(p){
-    var k=p.replace(/<[^>]*>/g,'').replace(/\\s+/g,' ').trim();
-    if(k&&!seen[k]){seen[k]=1;out.push(p.trim());}
-  });
-  el.innerHTML=out.join(' · ');
-  if(!el.dataset.tap){el.dataset.tap='1';el.onclick=function(){this.classList.toggle('exp');};}
-}
-map.on('layeradd layerremove baselayerchange overlayadd overlayremove',function(){setTimeout(tidyAttrib,60);});
-setTimeout(tidyAttrib,600);
+installAttrib(map);
 
 
 /* ---- fonds de carte (identiques au suivi solo) ---- */
@@ -1408,71 +1489,10 @@ if(owmKey){
 var windGroup=L.layerGroup();
 var overlays=Object.assign({'Balises (OpenSeaMap)':seamark,'Balises SHOM':shomBalise,'Vent animé (Open‑Meteo)':windGroup},weather);
 /* ---- menu des calques (maison : ouverture au tap, indépendant de Leaflet) ---- */
-function buildLayerMenu(map, bases, overlays){
-  var btn=document.createElement('button');
-  btn.type='button'; btn.className='lyrbtn'; btn.setAttribute('aria-label','Calques'); btn.textContent='\\u2261';
-  var panel=document.createElement('div'); panel.className='lyrpanel';
-  var hB=document.createElement('div'); hB.className='grp'; hB.textContent='Fond de carte';
-  var boxB=document.createElement('div');
-  var hO=document.createElement('div'); hO.className='grp'; hO.textContent='Calques';
-  var boxO=document.createElement('div');
-  panel.appendChild(hB); panel.appendChild(boxB); panel.appendChild(hO); panel.appendChild(boxO);
-  document.body.appendChild(btn); document.body.appendChild(panel);
-  var current=null;
-  function addBase(name, layer){
-    var lab=document.createElement('label');
-    var inp=document.createElement('input'); inp.type='radio'; inp.name='lyrbase';
-    if(map.hasLayer(layer)){ inp.checked=true; current=layer; }
-    var sp=document.createElement('span'); sp.textContent=name;
-    lab.appendChild(inp); lab.appendChild(sp); boxB.appendChild(lab);
-    inp.onchange=function(){
-      if(!this.checked)return;
-      if(current&&current!==layer&&map.hasLayer(current))map.removeLayer(current);
-      current=layer;
-      if(!map.hasLayer(layer))map.addLayer(layer);
-      if(layer.bringToBack){try{layer.bringToBack();}catch(e){}}
-      map.fire('baselayerchange',{layer:layer,name:name});
-    };
-  }
-  function addOverlay(layer, name){
-    var lab=document.createElement('label');
-    var inp=document.createElement('input'); inp.type='checkbox'; inp.checked=map.hasLayer(layer);
-    var sp=document.createElement('span'); sp.textContent=name;
-    lab.appendChild(inp); lab.appendChild(sp); boxO.appendChild(lab);
-    inp.onchange=function(){
-      if(this.checked){ if(!map.hasLayer(layer))map.addLayer(layer); map.fire('overlayadd',{layer:layer,name:name}); }
-      else { if(map.hasLayer(layer))map.removeLayer(layer); map.fire('overlayremove',{layer:layer,name:name}); }
-    };
-  }
-  for(var b in bases) addBase(b, bases[b]);
-  for(var o in overlays) addOverlay(overlays[o], o);
-  btn.onclick=function(e){ e.stopPropagation(); panel.classList.toggle('open'); };
-  panel.addEventListener('click',function(e){ e.stopPropagation(); });
-  document.addEventListener('click',function(){ panel.classList.remove('open'); });
-  return { addOverlay:addOverlay, panel:panel, button:btn };
-}
-var layerCtl;
-try { layerCtl = buildLayerMenu(map, bases, overlays); }
-catch(e){
-  try{
-    var secours=L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png',{maxZoom:18,attribution:'&copy; OpenStreetMap'});
-    secours.addTo(map);
-    layerCtl={addOverlay:function(){},panel:null,button:null};
-  }catch(e2){}
-}
-if(!map._loaded || !Object.keys(bases).length){ try{ L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png',{maxZoom:18}).addTo(map); }catch(e){} }
-var MODELS=[{v:'best_match',t:'Auto (best match)'},{v:'meteofrance_arome_france_hd',t:'AROME France HD 1.5 km'},{v:'meteofrance_arpege_europe',t:'ARPEGE Europe 11 km'},{v:'icon_eu',t:'ICON-EU 7 km'},{v:'ecmwf_ifs025',t:'ECMWF 25 km'},{v:'gfs_seamless',t:'GFS 25 km'}];
-var HOURS=[{v:0,t:'Maintenant'},{v:6,t:'+6 h'},{v:12,t:'+12 h'},{v:24,t:'+24 h'},{v:48,t:'+48 h'}];
-function fillSel(sel,list,def){list.forEach(function(o){var e=document.createElement('option');e.value=o.v;e.textContent=o.t;if(String(o.v)===String(def))e.selected=true;sel.appendChild(e);});}
+var layerCtl = installLayerMenu(map, bases, overlays);
 fillSel($('windModel'),MODELS,'best_match');fillSel($('windHour'),HOURS,0);
-var windLayer=null,windBusy=false;
-function windOpts(d){return {displayValues:true,displayOptions:{velocityType:'Vent',position:'bottomleft',emptyString:'—',angleConvention:'bearingCW',speedUnit:'kt'},data:d,minVelocity:0,maxVelocity:18,velocityScale:0.014,opacity:1,lineWidth:2.4,particleAge:110,paneName:'windPane',particleMultiplier:1/170,colorScale:['#3a4cff','#0091ff','#00c2ff','#00e0a0','#61ff3d','#d4ff00','#ffd000','#ff8a00','#ff3b2f','#ff0a78']};}
-function loadWind(){if(!L.velocityLayer)return;windBusy=true;var c=map.getCenter();var model=$('windModel').value,hour=$('windHour').value;fetch('/api/wind?lat='+c.lat.toFixed(2)+'&lon='+c.lng.toFixed(2)+'&model='+encodeURIComponent(model)+'&hour='+hour).then(function(r){return r.json();}).then(function(d){windBusy=false;if(windLayer){windGroup.removeLayer(windLayer);windLayer=null;}windLayer=L.velocityLayer(windOpts(d));windGroup.addLayer(windLayer);}).catch(function(){windBusy=false;});}
-map.on('overlayadd',function(e){if(e.layer!==windGroup)return;$('windCtl').style.display='block';if(!windLayer&&!windBusy)loadWind();});
-map.on('overlayremove',function(e){if(e.layer!==windGroup)return;$('windCtl').style.display='none';if(windLayer){windGroup.removeLayer(windLayer);windLayer=null;}});
-$('windModel').onchange=function(){if(map.hasLayer(windGroup))loadWind();};
-$('windHour').onchange=function(){if(map.hasLayer(windGroup))loadWind();};
-fetch('https://api.rainviewer.com/public/weather-maps.json').then(function(r){return r.json();}).then(function(d){if(d&&d.radar&&d.radar.past&&d.radar.past.length){var fr=d.radar.past[d.radar.past.length-1];var radar=L.tileLayer((d.host||'https://tilecache.rainviewer.com')+fr.path+'/256/{z}/{x}/{y}/2/1_1.png',{opacity:0.6,maxZoom:12,attribution:'Radar &copy; RainViewer'});layerCtl.addOverlay(radar,'Radar pluie');}}).catch(function(){});
+initVent(map, windGroup);
+installRadar(layerCtl);
 
 /* ---- gestion des bateaux ---- */
 function boatColor(id){var h=0;for(var i=0;i<id.length;i++)h=(h*31+id.charCodeAt(i))>>>0;return 'hsl('+(h%360)+',85%,55%)';}
@@ -1481,7 +1501,15 @@ var boats={};
 var showNames=true;
 var legOpen=true;
 function courtNom(n){n=String(n||'');return n.length>15?n.slice(0,14)+'…':n;}
-var OFFLINE_MS=15*60*1000; // seuil hors-ligne (15 min) — réglable
+/* Un bateau suivi par AIS n'emet qu'un point par intervalle reglé sur la flotte :
+   le seuil hors-ligne doit lui laisser le temps de deux points, sinon toute la
+   flotte s'affiche eteinte entre deux relevés. Recalculé au chargement. */
+var OFFLINE_MS=15*60*1000;
+function majSeuilHorsLigne(intervalleMin){
+  var v=parseInt(intervalleMin,10);
+  if(!v||v<1)return;
+  OFFLINE_MS=Math.max(15*60*1000, Math.round(v*60*1000*2.5));
+}
 function isOnline(b){return !!(b.last && (Date.now()-b.last[2])<=OFFLINE_MS);}
 function fmtAge(ms){var s=Math.max(0,Math.floor((Date.now()-ms)/1000));if(s<60)return 'à l\\u2019instant';if(s<3600)return 'il y a '+Math.floor(s/60)+' min';return 'il y a '+Math.floor(s/3600)+' h';}
 function updateBoatStyle(b){
@@ -1522,7 +1550,6 @@ function drawVector(b){
 function redrawVectors(){for(var k in boats){var b=boats[k];if(b.vec||((b.last)&&b.last[4]!=null))drawVector(b);}applyVisibility();}
 map.on('zoomend',redrawVectors);
 
-function flecheDir(d){ if(d==null)return ''; var a=['↓','↙','←','↖','↑','↗','→','↘']; return a[Math.round(((d%360)+360)%360/45)%8]; }
 function ficheBateau(id){
   var b=boats[id]; if(!b||!b.last)return;
   var p=b.last, ll=[p[0],p[1]];
@@ -1533,8 +1560,8 @@ function ficheBateau(id){
   var pop=L.popup({maxWidth:260,autoPan:true}).setLatLng(ll)
     .setContent(ent+nav+'<div style="font-size:12.5px;color:#8fb0c2;margin-top:4px">Vent…</div>').openOn(map);
   fetch('/api/point?lat='+p[0].toFixed(3)+'&lon='+p[1].toFixed(3)).then(function(r){return r.json();}).then(function(d){
-    var vent = (d.wind!=null) ? ('💨 '+Math.round(d.wind)+' kt'+(d.windDir!=null?' · '+flecheDir(d.windDir)+' '+Math.round(d.windDir)+'°':'')) : '💨 vent indisponible';
-    var cour = (d.curSpeed!=null&&d.curSpeed>0) ? ('<br>🌊 courant '+d.curSpeed.toFixed(1)+' kt'+(d.curDir!=null?' · '+flecheDir(d.curDir)+' '+Math.round(d.curDir)+'°':'')) : '';
+    var vent = (d.wind!=null) ? ('💨 '+Math.round(d.wind)+' kt'+(d.windDir!=null?' · '+dirArrow(d.windDir)+' '+Math.round(d.windDir)+'°':'')) : '💨 vent indisponible';
+    var cour = (d.curSpeed!=null&&d.curSpeed>0) ? ('<br>🌊 courant '+d.curSpeed.toFixed(1)+' kt'+(d.curDir!=null?' · '+dirArrow(d.curDir)+' '+Math.round(d.curDir)+'°':'')) : '';
     var pres = (d.pressure!=null) ? ('<br>🔽 '+Math.round(d.pressure)+' hPa') : '';
     pop.setContent(ent+nav+'<div style="font-size:12.5px;line-height:1.7;margin-top:4px">'+vent+cour+pres+'</div>');
   }).catch(function(){
@@ -1542,10 +1569,10 @@ function ficheBateau(id){
   });
 }
 
-function boatAdd(id,name,p){
+function boatAdd(id,name,p,dejaTrace){
   var b=ensureBoat(id,name);
   var ll=[p[0],p[1]];
-  b.trace.addLatLng(ll);
+  if(!dejaTrace) b.trace.addLatLng(ll);
   if(!b.marker){
     b.marker=L.circleMarker(ll,{radius:6,color:'#fff',weight:1.6,fillColor:b.color,fillOpacity:1}).addTo(map)
       .bindTooltip(courtNom(b.name),{permanent:true,direction:'right',offset:[9,0],className:'boat-name'});
@@ -1575,7 +1602,7 @@ function renderLegend(){
       var cp=(b.last&&b.last[4]!=null)?(Math.round(b.last[4])+'°'):'';
       right=cp?(sp+' · '+cp):sp;
     } else right=(b.last?'vu '+fmtAge(b.last[2]):'—');
-    html+='<div class="lgi'+(on?'':' off')+'" data-id="'+k+'"><span class="dot" style="background:'+(on?b.color:'#6b7f8c')+'"></span><span>'+esc(b.name)+'</span><span class="sp'+(on?'':' offsp')+'">'+right+'</span><span class="del" data-del="'+k+'" title="Retirer de la flotte">✕</span></div>';});
+    html+='<div class="lgi'+(on?'':' off')+'" data-id="'+k+'"><span class="dot" style="background:'+(on?b.color:'#6b7f8c')+'"></span><span>'+esc(b.name)+'</span><span class="sp'+(on?'':' offsp')+'">'+right+'</span>'+(ADMK?'<span class="del" data-del="'+k+'" title="Retirer de la flotte">✕</span>':'')+'</div>';});
   html+='<div class="lgexp">⤓ Traces flotte : <a href="/api/fleets/'+fid+'/export?format=gpx">GPX</a> · <a href="/api/fleets/'+fid+'/export?format=csv">CSV</a></div>';
   el.innerHTML=html;
   var tg=$('lgtog');
@@ -1585,7 +1612,7 @@ function renderLegend(){
   var rows=el.querySelectorAll('.lgi');
   for(var i=0;i<rows.length;i++){rows[i].onclick=function(){var b=boats[this.getAttribute('data-id')];if(b&&b.last)map.setView([b.last[0],b.last[1]],Math.max(map.getZoom(),12));};}
   var dels=el.querySelectorAll('.del');
-  for(var d=0;d<dels.length;d++){dels[d].onclick=function(ev){ev.stopPropagation();var did=this.getAttribute('data-del');var b=boats[did];if(!confirm('Retirer '+((b&&b.name)||'ce bateau')+' de la flotte ?'))return;fetch('/api/fleets/'+fid+'/remove',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({trackId:did})}).then(function(){if(b){if(b.marker)map.removeLayer(b.marker);if(b.trace)map.removeLayer(b.trace);if(b.vec)map.removeLayer(b.vec);}delete boats[did];renderLegend();}).catch(function(){});};}
+  for(var d=0;d<dels.length;d++){dels[d].onclick=function(ev){ev.stopPropagation();var did=this.getAttribute('data-del');var b=boats[did];if(!confirm('Retirer '+((b&&b.name)||'ce bateau')+' de la flotte ?'))return;fetch('/api/fleets/'+fid+'/remove',{method:'POST',headers:{'Content-Type':'application/json','x-admin-key':ADMK},body:JSON.stringify({trackId:did})}).then(function(){if(b){if(b.marker)map.removeLayer(b.marker);if(b.trace)map.removeLayer(b.trace);if(b.vec)map.removeLayer(b.vec);}delete boats[did];renderLegend();}).catch(function(){});};}
 }
 function refreshStatus(){for(var k in boats)updateBoatStyle(boats[k]);applyVisibility();renderLegend();}
 setInterval(refreshStatus,30000);
@@ -1595,10 +1622,20 @@ $('fit').onclick=fitAll;
 /* ---- chargement + temps réel ---- */
 if(!fid){$('flname').textContent='Lien de flotte invalide';}
 else{
-  fetch('/api/fleets/'+fid).then(function(r){return r.json();}).then(function(d){
+  /* tracks=1 rapporte l'historique deja enregistré : sans lui, les traces
+     repartent de zero a chaque rechargement de la page. */
+  fetch('/api/fleets/'+fid+'?tracks=1&max=400').then(function(r){return r.json();}).then(function(d){
     if(d.error){$('flname').textContent='Flotte introuvable';$('flcount').textContent='';return;}
     $('flname').textContent=d.name||'Flotte';
-    (d.boats||[]).forEach(function(bo){ if(bo.last) boatAdd(bo.id,bo.name,bo.last); else ensureBoat(bo.id,bo.name); });
+    majSeuilHorsLigne(d.aisIntervalMin);
+    (d.boats||[]).forEach(function(bo){
+      var b=ensureBoat(bo.id,bo.name);
+      var pts=bo.points||[];
+      if(pts.length){
+        b.trace.setLatLngs(pts.map(function(p){return [p[0],p[1]];}));
+        boatAdd(bo.id,bo.name,pts[pts.length-1],true);
+      } else if(bo.last){ boatAdd(bo.id,bo.name,bo.last); }
+    });
     redrawVectors();
     renderLegend(); fitAll(); subscribe();
   }).catch(function(){$('flcount').textContent='Erreur de chargement';});
@@ -1614,7 +1651,6 @@ function subscribe(){
 }
 
 /* ---- pointeur météo / courant ---- */
-function dirArrow(deg){var a=['↓','↙','←','↖','↑','↗','→','↘'];return a[Math.round(((deg||0)%360)/45)%8];}
 map.on('click',function(e){
   var ll=e.latlng;
   var pop=L.popup({maxWidth:230}).setLatLng(ll).setContent('Chargement…').openOn(map);
@@ -1772,13 +1808,18 @@ const PAGE_JOIN = `<!DOCTYPE html>
 <script>
 "use strict";
 var fid=new URLSearchParams(location.search).get('fleet');
+var ADMK=new URLSearchParams(location.search).get('k')||'';
 var $=function(i){return document.getElementById(i);};
+/* Ajouter un MMSI ou changer l'intervalle consomme le quota AIS de la flotte :
+   ces commandes ne sont offertes qu'avec la clé de gestion (/join?fleet=…&k=…).
+   L'inscription d'un bateau par lien d'invitation, elle, reste ouverte. */
+if(!ADMK){ var bx=document.getElementById('aisBox'); if(bx) bx.style.display='none'; }
 if(!fid){$('sub').textContent='Lien de flotte invalide ou manquant.';$('form').style.display='none';$('aisBox').style.display='none';}
 $('aisGo').onclick=function(){
   var nm=$('aisName').value.trim(), mm=$('aisMmsi').value.replace(/[^0-9]/g,'');
   if(mm.length!==9){$('aisMsg').style.color='#e6584c';$('aisMsg').textContent='Le MMSI doit comporter 9 chiffres.';return;}
   $('aisMsg').style.color='';$('aisMsg').textContent='…';$('aisGo').disabled=true;
-  fetch('/api/fleets/'+fid+'/mmsi',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name:nm,mmsi:mm})})
+  fetch('/api/fleets/'+fid+'/mmsi',{method:'POST',headers:{'Content-Type':'application/json','x-admin-key':ADMK},body:JSON.stringify({name:nm,mmsi:mm})})
    .then(function(r){return r.json();}).then(function(d){
      $('aisGo').disabled=false;
      if(d.error){$('aisMsg').style.color='#e6584c';$('aisMsg').textContent=d.error;return;}
@@ -1798,7 +1839,7 @@ fetch('/api/fleets/'+fid+'/settings').then(function(r){return r.json();}).then(f
 $('aisInt').onchange=function(){
   var v=this.value;
   $('aisIntMsg').style.color='';$('aisIntMsg').textContent='Enregistrement…';
-  fetch('/api/fleets/'+fid+'/settings',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({aisIntervalMin:parseInt(v,10)})})
+  fetch('/api/fleets/'+fid+'/settings',{method:'POST',headers:{'Content-Type':'application/json','x-admin-key':ADMK},body:JSON.stringify({aisIntervalMin:parseInt(v,10)})})
    .then(function(r){return r.json();}).then(function(d){
      if(d.error){$('aisIntMsg').style.color='#e6584c';$('aisIntMsg').textContent=d.error;return;}
      $('aisIntMsg').style.color='#37c871';$('aisIntMsg').textContent='Réglé sur 1 point toutes les '+d.aisIntervalMin+' min.';
@@ -1948,6 +1989,7 @@ function saveKey(k){ try{ localStorage.setItem('st_key',k); }catch(e){} }
 function forgetKey(){ try{ localStorage.removeItem('st_key'); }catch(e){} }
 var ORIGIN=location.origin;
 var AIS=false;
+var INTERVALLES={}; /* intervalle AIS par flotte, pour le seuil hors-ligne */
 
 function api(path,opts){
   opts=opts||{};
@@ -1992,6 +2034,7 @@ function render(fleets){
   if(!fleets.length){el.innerHTML='<div class="card"><div class="empty">Aucune flotte pour l\\u2019instant.<br>Crée la première ci-dessus.</div></div>';return;}
   var h='';
   fleets.forEach(function(f){
+    INTERVALLES[f.id]=f.aisIntervalMin;
     var vf=ORIGIN+'/vf?id='+f.id;
     var jn=ORIGIN+'/join?fleet='+f.id;
     h+='<div class="card" data-f="'+f.id+'">'
@@ -2041,10 +2084,11 @@ function wire(fleets){
   document.querySelectorAll('[data-int]').forEach(function(sel){sel.onchange=function(){
     var fid=this.getAttribute('data-int'), v=parseInt(this.value,10);
     var m=document.querySelector('[data-msg="'+fid+'"]');
-    fetch('/api/fleets/'+fid+'/settings',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({aisIntervalMin:v})})
-      .then(function(r){return r.json();}).then(function(d){
-        if(d.error){say(m,d.error,'err');return;}
-        say(m,'AIS : un point toutes les '+d.aisIntervalMin+' min.','ok');
+    api('/api/fleets/'+fid+'/settings',{method:'POST',body:JSON.stringify({aisIntervalMin:v})}).then(function(r){
+        if(r.code!==200){say(m,(r.body&&r.body.error)||('Erreur '+r.code),'err');return;}
+        INTERVALLES[fid]=r.body.aisIntervalMin;
+        say(m,'AIS : un point toutes les '+r.body.aisIntervalMin+' min.','ok');
+        loadBoats(fid);
       });
   };});
   document.querySelectorAll('[data-del]').forEach(function(b){b.onclick=function(){
@@ -2055,6 +2099,11 @@ function wire(fleets){
   };});
 }
 
+/* meme regle que la carte de flotte : 2,5 intervalles AIS, plancher 15 min */
+function seuilHorsLigne(fid){
+  var v=parseInt(INTERVALLES[fid],10);
+  return (v&&v>0)?Math.max(900000,Math.round(v*60000*2.5)):900000;
+}
 function loadBoats(fid){
   var box=document.querySelector('[data-boats="'+fid+'"]');
   fetch('/api/fleets/'+fid).then(function(r){return r.json();}).then(function(d){
@@ -2068,7 +2117,7 @@ function loadBoats(fid){
         +'<button class="sec" data-selnone="1" style="width:auto;padding:6px 12px;margin:0">Aucun</button></div>'
         +'<div data-selmsg="1" style="font-size:12px;margin:0 0 8px;min-height:15px"></div>'
         + b.map(function(x){
-        var on=x.last&&(Date.now()-x.last[2])<900000;
+        var on=x.last&&(Date.now()-x.last[2])<seuilHorsLigne(fid);
         var st=x.last?(on?((x.last[3]!=null?(Math.round(x.last[3]*10)/10)+' kt':'en ligne')):('vu '+age(x.last[2]))):'jamais vu';
         var suiv=x.suivi!==false;
         return '<div class="boat"'+(suiv?'':' style="opacity:.5"')+'>'
@@ -2076,7 +2125,8 @@ function loadBoats(fid){
           +'<span class="dot" style="background:'+(on?'#37c871':'#6b7f8c')+'"></span>'
           +'<span class="bn">'+esc(x.name)+'</span><span class="bs">'+st+'</span>'
           +'<span class="x" data-ren="'+x.id+'|'+esc(x.name)+'">✎</span>'
-          +'<span class="x" data-rm="'+fid+'|'+x.id+'|'+esc(x.name)+'">✕</span></div>';
+          +'<span class="x" data-rm="'+fid+'|'+x.id+'|'+esc(x.name)+'" title="Retirer de la flotte">✕</span>'
+          +'<span class="x" data-purge="'+x.id+'|'+esc(x.name)+'" title="Supprimer définitivement">🗑</span></div>';
       }).join('');
     }
     box.innerHTML+='<div class="lbl" style="margin-top:12px">Ajouter un bateau par AIS (MMSI)</div>';
@@ -2124,10 +2174,19 @@ function loadBoats(fid){
       var nv=prompt('Nom du bateau :',pr[1]); if(!nv||!nv.trim())return;
       api('/api/admin/boats/'+pr[0],{method:'POST',body:JSON.stringify({name:nv.trim()})}).then(function(){loadBoats(fid);});
     };});
+    box.querySelectorAll('[data-purge]').forEach(function(s){s.onclick=function(){
+      var pr=this.getAttribute('data-purge').split('|');
+      if(!confirm('Supprimer définitivement '+pr[1]+' ?\\n\\nSa trace, son MMSI et ses appartenances seront effacés. Action irréversible.'))return;
+      api('/api/admin/boats/'+pr[0],{method:'DELETE'}).then(function(r){
+        var m=document.querySelector('[data-msg="'+fid+'"]');
+        if(r.code!==200){say(m,(r.body&&r.body.error)||('Erreur '+r.code),'err');return;}
+        say(m,'Bateau supprimé.','ok'); loadBoats(fid); reload();
+      });
+    };});
     box.querySelectorAll('[data-rm]').forEach(function(s){s.onclick=function(){
       var parts=this.getAttribute('data-rm').split('|');
       if(!confirm('Retirer '+parts[2]+' de la flotte ?'))return;
-      fetch('/api/fleets/'+parts[0]+'/remove',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({trackId:parts[1]})})
+      api('/api/fleets/'+parts[0]+'/remove',{method:'POST',body:JSON.stringify({trackId:parts[1]})})
         .then(function(){loadBoats(parts[0]);reload();});
     };});
     var derniereCharge=null;
@@ -2240,7 +2299,7 @@ boot();
 </html>
 `;
 const ICONS = { '/icon-180.png': Buffer.from('iVBORw0KGgoAAAANSUhEUgAAALQAAAC0CAIAAACyr5FlAAAGrklEQVR42u2dPW5VSRCFr4smISdxCiLzIAIStkHGQljELAIhRoMmYRsIiQAhUnsFLAFhJvCMsYzxu91dP6eqz5EDB+/ndvXXp6r7dt93dO/40UZRN0kYAopwUISDIhwU4aAIB0U4KMJBEQ6KcFCEg6IIB0U4KMJBGaqtOij6R8X5OeEgCrs/pDoujTSofUs5VhqZ0P/2KpQ0MkFKKsIhkuYKc1LSiIXfBWdDpBELIpIfDqmyXpcHkUYsiEhOOKT66j42IkIy2NJUziHr3Q6EtBAhGWx7BucQ7h/AspC2LBlHcmf/i3+cf/eOBgAfbREyulDY83ZzXAD4aIWxmARi/4dbgRKdYlo9MkyZuP0bTSiJs5BWiQx/LG68AH1EgvhoBcgIZ8LDSCL4aKnJ0MXi7MvHy/8fnDyFMxJ3PlpSMtDcwgkRXz6EZDjnGvxpf4RzaLQqIxb6FuLlH0IyUlqIi3+0FGTUwELZQuz9Q0hGYgsx9g+pH8HpaW291mHAMYH2kdyJjZ0bH1PNtDSPBksGwsC1Wg6/6YvGv8Ws+JClyLgYppd/J6//vv31p58//PouxBRj4x9wNYdF9G/s14NkXOXj4KeVLEEalG3oRsc61hY32Mbzi0FykZJkHBzZO23jd+ZhWjuPf5R2ckFJK1rBNTL8g3zofjVIfhEE21CJxf6+6bKNKDoHP0TVPCScDOehNkzGHvOAGPp6vRCfVub3hbv1RC8f6lve06aViITS+3bThILQQF3zkNSe4X/NXeaRt5mq6xy+1cZYvPxt49oFux6b01j2kHS2EU7GgHmENBkjrfTbRrowpeRj2s4zHWwfjmxgQoHl2wUOL9uwiqnIzz8X83CNwJx5SPlxY2cbM3ykiJ4428bKCSWmmyf6KMEUFDlJ50guVQvSmVj42IY/Hxng6PSrqicMEgyY0cwipaIQVG1UNQ8pSYb/5oGSfIhP9F3bL3Ly6q+IWAruyBm6NlDnmNlHGUPGtp1+eg+yszpTWkkxpw/nAzCqAtgHMztcomxjPj7mnd1/VbV+4QZAp5/eQ10PdFrpHRAzt5cgbGOCD49YregcMGRUUn44lB4opTsKayQXCekM9en7sG3YnWwY48M2U3ReDOS8g8KIcIWaA7ba+M88WHNE5ZQEdWja29f85SyaRz04stiG75p6KBz8jb6VZv5Zf0VrS7XqZZpc7OKc9ck+6dZD0zzeI33NwexGOMrYxoB5EI71Zrap+MgHB+whNqYVkrGQeTCtkI8ScDChEA6aB+FY3jbw+RCSQTGt0DwqwlHbNpD5QIHD9QGu8AKJhoC3cIVqY9I87EjqhMPlJ9RZfBiqpwehaw5OUlhzkAzQyhQIDtakF3zgxAHUOZhQ6sNBM7BOLqYR7ofDcsJy0VRP2/hx/n0hgjv7Di6thCQUKETOvnxkzUGh8yEOg3L/i/948w/JwCnp6Bw0D104bGpS2oYtH/295uEce9yPZAAuEzCtMLmow9HpUbdjTtvo5aPbNoYqAToHBQwHbQM2uRzdO340gZb5o9AUnlSx+yKvPmLl4ZNnPhO3gbrSJ6ckSCsKNbndzaAIMsqmlbFY6PBx8afFhManhUXDKa1sfg/Z1HwSkkiUVcz3sVtO2bat+aeJ+AdeXY3XQVCQ9lQ7p6GmEOjOgTjGhxVVEX3vl1DmWufqHF///Pb/v984QR3W/Zd38xSku/F0axXJUDFFqUo9PQNmKsuTcGjS6BEpjz9tAwCOHlTJhy0ZSkYu64wDekYoHJ3Akg+TKOnVf9rOQT6qkLFxsw/lCwfNo4RtmDkH+chPBlBaIR+A0TCDox9k8jEeB5sVakvn4Jq6j8ziLFDXTfNAKDVwp7Ir84HWdns4WHxkKzV8nYN8JCTDMa2Qj2xk+NYcnLxki6Qgt2oF84CankTPVshHEjI2hRNvg0xqQhl/Suo3Uj6D5J6XW0zY+o9C7ekDEEpMzqVFVGwtLISqfFztlUBErI4rBtXyLXKIGfARYiS2R1jjZnmhcFy2XMS6z9RB8TjTHD35j4bD0kJu78suXAKesgKwLIQBhwsf8f2digwkOIxTTBohrSPPwvH47buNQtXnF89n3s6jCRThoPoVtHzeB3BdgrHvVLc0ESyGSIYNDC1ZNAsgkmdfS0sZ2aSIZNvu1BJHOREiOXfB5YTjWsRhKUm+M7JtBYRGSZXdsm2rpFhKyu2gbltJXesnEdJAOHb34gAu6x2taNua4iGaHeK9FYpwUISDIhwU4aAIB0U4KMJBEQ6KcFCEg6IIB0U4KAX9C2pef+UnN8OcAAAAAElFTkSuQmCC', 'base64'), '/icon-192.png': Buffer.from('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', 'base64'), '/icon-512.png': Buffer.from('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', 'base64') };
-const BUILD = '24/07 13:51';
+const BUILD = '25/07 — revision audit';
 const LEAFLET_JS = `/* @preserve
  * Leaflet 1.9.4, a JS library for interactive maps. https://leafletjs.com
  * (c) 2010-2023 Vladimir Agafonkin, (c) 2010-2011 CloudMade
@@ -2961,7 +3020,7 @@ const server = http.createServer(async (req, res) => {
       if (!clients.has(meta.id)) clients.set(meta.id, new Set());
       clients.get(meta.id).add(res);
       const ping = setInterval(() => { try { res.write(': ping\n\n'); } catch {} }, 25000);
-      req.on('close', () => { clearInterval(ping); const s = clients.get(meta.id); if (s) s.delete(res); });
+      req.on('close', () => { clearInterval(ping); const s = clients.get(meta.id); if (s) { s.delete(res); if (!s.size) clients.delete(meta.id); } });
       return;
     }
 
@@ -2981,12 +3040,18 @@ const server = http.createServer(async (req, res) => {
       if (p === '/api/admin/diag' && req.method === 'GET') {
         const names = Object.keys(process.env).filter((n) => /AIS|OWM|UPSTASH|ADMIN|DATA|PORT|VESSEL/i.test(n));
         const suivis = aisInfo.size, total = Object.keys(aisMap).length;
+        const horsPlafond = aisHorsPlafond();
         const resume = [
           'Version ' + BUILD,
           'Bateaux AIS : ' + suivis + ' suivis sur ' + total,
-          'VesselAPI : ' + (VAPI_KEY ? vapiLastEvent : 'non configure'),
+          horsPlafond.length
+            ? 'Plafond aisstream : ' + AIS_PLAFOND + ' MMSI en temps reel, ' + horsPlafond.length + ' bateau(x) uniquement via VesselAPI'
+            : 'Plafond aisstream : ' + suivis + '/' + AIS_PLAFOND + ' MMSI, aucun bateau exclu',
+          'VesselAPI : ' + (VAPI_KEY ? vapiLastEvent : 'non configure')
+            + (VAPI_KEY && vapiPollMs ? ' — 1 interrogation toutes les ' + Math.round(vapiPollMs / 60000) + ' min' : ''),
           'aisstream : ' + (AIS_KEY ? (aisWs ? 'connecte' : 'deconnecte') + ' — ' + aisLastEvent + (aisProchain > Date.now() ? ' (attente ' + Math.round((aisProchain - Date.now()) / 60000) + ' min)' : '') : 'non configure'),
           'Stockage : ' + (stockErreurs ? stockErreurs + ' erreur(s) — ' + stockDerniereErreur : 'aucune erreur'),
+          'API : ' + (apiErreurs ? apiErreurs + ' erreur(s) — ' + apiDerniereErreur : 'aucune erreur'),
           'Meteo OWM : ' + (process.env.OWM_API_KEY ? 'cle presente' : 'absente')
         ];
         return json(res, 200, {
@@ -3000,6 +3065,8 @@ const server = http.createServer(async (req, res) => {
           aisDernierEvenement: aisLastEvent,
           aisMmsiSuivis: Array.from(aisInfo.keys()),
           aisMmsiEnregistres: Object.keys(aisMap).length,
+          aisPlafond: AIS_PLAFOND,
+          aisMmsiHorsPlafond: horsPlafond,
           aisAbonnes: aisSubCount,
           aisMessagesRecus: aisMsgCount,
           aisDernierMessageIlYaSec: aisLastMsgAt ? Math.round((Date.now() - aisLastMsgAt) / 1000) : null,
@@ -3010,7 +3077,10 @@ const server = http.createServer(async (req, res) => {
           vesselapiDerniereLectureIlYaSec: vapiLastAt ? Math.round((Date.now() - vapiLastAt) / 1000) : null,
           vesselapiReponseBrute: vapiBrut,
           stockageErreurs: stockErreurs,
-          stockageDerniereErreur: stockDerniereErreur || null
+          stockageDerniereErreur: stockDerniereErreur || null,
+          apiErreurs: apiErreurs,
+          apiDerniereErreur: apiDerniereErreur || null,
+          apiDerniereErreurIlYaSec: apiDerniereErreurAt ? Math.round((Date.now() - apiDerniereErreurAt) / 1000) : null
         });
       }
       if (p === '/api/admin/aistest' && req.method === 'GET') {
@@ -3173,19 +3243,35 @@ const server = http.createServer(async (req, res) => {
         return json(res, 200, { id: mAdmF[1], name: nm });
       }
       if (mAdmF && req.method === 'DELETE') {
+        const detaches = await fleetDetachAll(mAdmF[1]);
         await store.fleetDelete(mAdmF[1]);
         await aisRefresh(false);
-        return json(res, 200, { ok: true });
+        return json(res, 200, { ok: true, detaches });
+      }
+      /* purge complete d'un bateau : traces, meta, appartenances et entree MMSI */
+      if (mAdmB && req.method === 'DELETE') {
+        const tid = mAdmB[1];
+        const meta = await store.getMeta(tid);
+        if (!meta) return json(res, 404, { error: 'bateau introuvable' });
+        for (const fid of (meta.fleets || [])) {
+          try { await store.fleetRemove(fid, tid); broadcastFleet(fid, { rm: tid }); } catch {}
+        }
+        if (meta.mmsi) { try { await store.mmsiDel(String(meta.mmsi)); } catch {} }
+        try { await store.boatDelete(tid); } catch {}
+        await aisRefresh(false);
+        return json(res, 200, { ok: true, nom: meta.name, mmsi: meta.mmsi || null });
       }
       return json(res, 404, { error: 'route console inconnue' });
     }
     const mFleetRemove = p.match(/^\/api\/fleets\/([a-f0-9]{16})\/remove$/);
     if (mFleetRemove && req.method === 'POST') {
+      if (!adminOk(req, u)) return json(res, 401, ERR_GESTION);
       let body; try { body = await readBody(req); } catch { return json(res, 400, { error: 'json' }); }
       const tid = String(body.trackId || '');
       if (!/^[a-f0-9]{16}$/.test(tid)) return json(res, 400, { error: 'trackId invalide' });
-      await store.fleetRemove(mFleetRemove[1], tid);
+      await fleetDetach(mFleetRemove[1], tid);
       broadcastFleet(mFleetRemove[1], { rm: tid });
+      await aisRefresh(false);
       return json(res, 200, { ok: true });
     }
     const mFleetSet = p.match(/^\/api\/fleets\/([a-f0-9]{16})\/settings$/);
@@ -3197,6 +3283,7 @@ const server = http.createServer(async (req, res) => {
         return json(res, 200, { aisIntervalMin: (mn !== null && mn >= 1 && mn <= 180) ? mn : AIS_DEFAULT_MIN, aisEnabled: !!(AIS_KEY || VAPI_KEY), aisDefaultMin: AIS_DEFAULT_MIN });
       }
       if (req.method === 'POST') {
+        if (!adminOk(req, u)) return json(res, 401, ERR_GESTION);
         let body; try { body = await readBody(req); } catch { return json(res, 400, { error: 'json' }); }
         const mn = num(parseInt(body.aisIntervalMin, 10));
         if (mn === null || mn < 1 || mn > 180) return json(res, 400, { error: 'Intervalle attendu entre 1 et 180 minutes' });
@@ -3208,6 +3295,7 @@ const server = http.createServer(async (req, res) => {
     const mFleetImp = p.match(/^\/api\/fleets\/([a-f0-9]{16})\/mmsi\/import$/);
     if (mFleetImp && req.method === 'POST') {
       const fid = mFleetImp[1];
+      if (!adminOk(req, u)) return json(res, 401, ERR_GESTION);
       const fleet = await store.fleetGet(fid); if (!fleet) return json(res, 404, { error: 'flotte introuvable' });
       if (!AIS_KEY && !VAPI_KEY) return json(res, 503, { error: 'Suivi AIS non configure sur ce serveur' });
       let body; try { body = await readBody(req); } catch { return json(res, 400, { error: 'json' }); }
@@ -3235,17 +3323,17 @@ const server = http.createServer(async (req, res) => {
       for (const it of items) {
         const mmsi = it.mmsi, nom = it.name || ('MMSI ' + mmsi);
         if (known[mmsi]) {
-          await store.fleetAdd(fid, known[mmsi]);
           try {
             const m0 = await store.getMeta(known[mmsi]);
             if (m0 && it.name && m0.name !== nom) { m0.name = nom; await store.setMeta(m0); bilan.renommes++; }
           } catch {}
+          await fleetAttach(fid, known[mmsi]);
           bilan.deja++; continue;
         }
         const id = id16(), publishKey = key24();
         const meta = { id, name: nom, keyHash: sha(publishKey), createdAt: Date.now(), fleets: [fid], mmsi: mmsi };
         await store.create(meta);
-        await store.fleetAdd(fid, id);
+        await fleetAttach(fid, id);
         await store.mmsiSet(mmsi, id);
         known[mmsi] = id;
         bilan.ajoutes++;
@@ -3257,17 +3345,18 @@ const server = http.createServer(async (req, res) => {
     const mFleetMmsi = p.match(/^\/api\/fleets\/([a-f0-9]{16})\/mmsi$/);
     if (mFleetMmsi && req.method === 'POST') {
       const fid = mFleetMmsi[1];
+      if (!adminOk(req, u)) return json(res, 401, ERR_GESTION);
       const fleet = await store.fleetGet(fid); if (!fleet) return json(res, 404, { error: 'flotte introuvable' });
       let body; try { body = await readBody(req); } catch { return json(res, 400, { error: 'json' }); }
       const mmsi = String(body.mmsi || '').replace(/[^0-9]/g, '');
       if (!/^[0-9]{9}$/.test(mmsi)) return json(res, 400, { error: 'MMSI invalide (9 chiffres attendus)' });
       if (!AIS_KEY && !VAPI_KEY) return json(res, 503, { error: 'Suivi AIS non configure sur ce serveur (AIS_API_KEY ou VESSELAPI_KEY manquante)' });
       const known = await store.mmsiAll();
-      if (known && known[mmsi]) { await store.fleetAdd(fid, known[mmsi]); await aisRefresh(true); return json(res, 200, { id: known[mmsi], mmsi, already: true }); }
+      if (known && known[mmsi]) { await fleetAttach(fid, known[mmsi]); await aisRefresh(true); return json(res, 200, { id: known[mmsi], mmsi, already: true }); }
       const id = id16(), publishKey = key24();
       const meta = { id, name: (body.name || ('MMSI ' + mmsi)).toString().slice(0, 80), keyHash: sha(publishKey), createdAt: Date.now(), fleets: [fid], mmsi: mmsi };
       await store.create(meta);
-      await store.fleetAdd(fid, id);
+      await fleetAttach(fid, id);
       await store.mmsiSet(mmsi, id);
       await aisRefresh(true);
       return json(res, 201, { id, mmsi, name: meta.name });
@@ -3282,24 +3371,36 @@ const server = http.createServer(async (req, res) => {
       const id = id16(), publishKey = key24();
       const meta = { id, name: (body.name || 'Bateau').toString().slice(0, 80), keyHash: sha(publishKey), createdAt: Date.now(), fleets: [fid] };
       await store.create(meta);
-      await store.fleetAdd(fid, id);
+      await fleetAttach(fid, id);
       await store.devSet(meta.keyHash, id);
       return json(res, 201, { id, publishKey, name: meta.name, fleet: fid });
     }
     if (mFleet && req.method === 'GET') {
       const fleet = await store.fleetGet(mFleet[1]); if (!fleet) return json(res, 404, { error: 'flotte introuvable' });
       const ids = await store.fleetMembers(mFleet[1]);
+      /* ?tracks=1 renvoie aussi l'historique, decime a `max` points par bateau,
+         pour que la carte de flotte redessine les traces au chargement. */
+      const avecTraces = u.searchParams.get('tracks') === '1';
+      const maxPts = Math.min(2000, Math.max(50, parseInt(u.searchParams.get('max'), 10) || 400));
+      const depuis = num(parseFloat(u.searchParams.get('since'))) || 0;
       const boats = [];
       for (let i = 0; i < ids.length; i += 12) {
         const lot = await Promise.all(ids.slice(i, i + 12).map(async (id) => {
           try {
+            if (avecTraces) {
+              const [m, pts] = await Promise.all([store.getMeta(id), store.points(id)]);
+              if (!m) return null;
+              const util = depuis ? (pts || []).filter((x) => x[2] > depuis) : (pts || []);
+              return { id, name: m.name, last: util.length ? util[util.length - 1] : null, mmsi: m.mmsi || null, suivi: m.suivi !== false, points: decime(util, maxPts), total: util.length };
+            }
             const [m, last] = await Promise.all([store.getMeta(id), store.lastPoint(id)]);
             return m ? { id, name: m.name, last, mmsi: m.mmsi || null, suivi: m.suivi !== false } : null;
           } catch { return null; }
         }));
         for (const x of lot) if (x) boats.push(x);
       }
-      return json(res, 200, { id: fleet.id, name: fleet.name, boats });
+      const mn = num(fleet.aisIntervalMin);
+      return json(res, 200, { id: fleet.id, name: fleet.name, boats, aisIntervalMin: (mn !== null && mn >= 1 && mn <= 180) ? mn : AIS_DEFAULT_MIN });
     }
     if (mFleetStream && req.method === 'GET') {
       const fleet = await store.fleetGet(mFleetStream[1]); if (!fleet) return json(res, 404, { error: 'flotte introuvable' });
@@ -3308,7 +3409,7 @@ const server = http.createServer(async (req, res) => {
       if (!fleetClients.has(fleet.id)) fleetClients.set(fleet.id, new Set());
       fleetClients.get(fleet.id).add(res);
       const ping = setInterval(() => { try { res.write(': ping\n\n'); } catch {} }, 25000);
-      req.on('close', () => { clearInterval(ping); const st = fleetClients.get(fleet.id); if (st) st.delete(res); });
+      req.on('close', () => { clearInterval(ping); const st = fleetClients.get(fleet.id); if (st) { st.delete(res); if (!st.size) fleetClients.delete(fleet.id); } });
       return;
     }
 
@@ -3395,9 +3496,18 @@ const server = http.createServer(async (req, res) => {
       const pt = await fetchPoint(clat === null ? 47 : clat, clon === null ? -4 : clon);
       return json(res, 200, pt);
     }
-  } catch (e) { return json(res, 500, { error: 'stockage indisponible' }); }
+  } catch (e) {
+    /* le message reste generique cote client, mais l'erreur reelle est
+       consultable dans /api/admin/diag et dans les logs Render */
+    apiErreurs++;
+    apiDerniereErreur = (req.method + ' ' + p + ' — ' + ((e && (e.message || e.name)) || 'inconnue')).slice(0, 200);
+    apiDerniereErreurAt = Date.now();
+    console.error('[api]', apiDerniereErreur);
+    return json(res, 500, { error: 'stockage indisponible' });
+  }
 
   if (p === '/windy.js') { res.writeHead(200, { 'Content-Type': 'text/javascript; charset=utf-8' }); return res.end(PAGE_WINDYJS); }
+  if (p === '/carte.js') { res.writeHead(200, { 'Content-Type': 'text/javascript; charset=utf-8', 'Cache-Control': 'no-store' }); return res.end(PAGE_CARTEJS); }
   if (p === '/config.js') { res.writeHead(200, { 'Content-Type': 'text/javascript; charset=utf-8' }); return res.end('window.OWM_KEY=' + JSON.stringify(process.env.OWM_API_KEY || '') + ';'); }
   if (p === '/') return serveHTML(res, PAGE_INDEX, req.url);
   if (p === '/v') return serveHTML(res, PAGE_VIEWER, req.url);
@@ -3492,7 +3602,20 @@ async function aisIngest(mmsi, lat, lon, t, sog, cog) {
   } catch { return false; }
 }
 const AIS_ATTENTES = [30000, 60000, 180000, 600000, 1800000, 3600000, 7200000];
+const AIS_PLAFOND = 50; /* limite d'abonnement aisstream.io */
 let aisProchain = 0;
+/* les MMSI retenus pour le flux temps reel, du plus exigeant au moins exigeant */
+function aisPrioritaires() {
+  return Array.from(aisInfo.entries())
+    .sort((a, b) => (a[1].ms - b[1].ms) || String(a[0]).localeCompare(String(b[0])))
+    .slice(0, AIS_PLAFOND)
+    .map((e) => e[0]);
+}
+/* les MMSI suivis mais hors abonnement temps reel */
+function aisHorsPlafond() {
+  const dans = new Set(aisPrioritaires());
+  return Array.from(aisInfo.keys()).filter((m) => !dans.has(m));
+}
 function aisReconnect() {
   if (!AIS_KEY) return;
   aisRetry = Math.min(aisRetry + 1, AIS_ATTENTES.length);
@@ -3507,7 +3630,10 @@ function aisConnect(force) {
   if (!force && Date.now() < aisProchain) return;
   if (aisTimer) { clearTimeout(aisTimer); aisTimer = null; }
   if (aisWs) { try { aisWs.onclose = null; aisWs.close(); } catch {} aisWs = null; }
-  const list = Array.from(aisInfo.keys()).slice(0, 50);
+  /* aisstream plafonne a 50 MMSI par abonnement : on donne le temps reel aux
+     bateaux dont l'intervalle demande est le plus court, les autres restent
+     couverts par VesselAPI. */
+  const list = aisPrioritaires();
   if (!list.length) return;
   let ws;
   try { ws = new WebSocket('wss://stream.aisstream.io/v0/stream'); } catch { return aisReconnect(); }
@@ -3576,8 +3702,12 @@ async function vapiPoll() {
 function vapiSchedule() {
   if (vapiTimer) { clearInterval(vapiTimer); vapiTimer = null; }
   if (!VAPI_KEY) return;
-  let ms = 3600000;
-  for (const v of aisInfo.values()) if (v.ms && v.ms > ms) ms = v.ms;
+  /* on interroge au rythme du bateau le plus exigeant : interroger moins vite
+     que lui rendrait son reglage inoperant. Les planchers ci-dessous protegent
+     le quota mensuel en fonction du nombre de bateaux suivis. */
+  let ms = null;
+  for (const v of aisInfo.values()) if (v.ms && (ms === null || v.ms < ms)) ms = v.ms;
+  if (ms === null) ms = 3600000;
   const n = aisInfo.size;
   const mini = n > 50 ? 3600000 : (n > 20 ? 1800000 : 900000);
   if (ms < mini) ms = mini;
@@ -3626,6 +3756,10 @@ async function aisRefresh(reconnect) {
     }
     aisInfo.set(mmsi, { tid: tid, name: (meta && meta.name) || ('MMSI ' + mmsi), fleets: fids, ms: (best === null ? AIS_DEFAULT_MIN : best) * 60000 });
   }
+  /* on oublie l'etat des MMSI qui ne sont plus suivis (sinon les deux Map
+     grossissent indefiniment au fil des imports et des suppressions) */
+  for (const k of Array.from(aisLast.keys())) if (!aisInfo.has(k)) aisLast.delete(k);
+  for (const k of Array.from(aisLastT.keys())) if (!aisInfo.has(k)) aisLastT.delete(k);
   vapiSchedule();
   if (reconnect) aisConnect();
 }
