@@ -260,6 +260,7 @@ const fileStore = {
   setMeta: async (m) => { const t = fileLoad(m.id); if (!t) return; const pts = t.points; Object.assign(t, m); t.points = pts; t.fleets = m.fleets || []; fs.writeFileSync(fpath(m.id), JSON.stringify(t)); },
   append: async (id, pts) => { const t = fileLoad(id); if (!t) return 0; for (const p of pts) t.points.push(p); fs.writeFileSync(fpath(id), JSON.stringify(t)); return t.points.length; },
   points: async (id) => { const t = fileLoad(id); return t ? t.points : []; },
+  pointsRemplacer: async (id, pts) => { const t = fileLoad(id); if (!t) return 0; t.points = pts; fs.writeFileSync(fpath(id), JSON.stringify(t)); return pts.length; },
   lastPoint: async (id) => { const t = fileLoad(id); return t && t.points.length ? t.points[t.points.length - 1] : null; },
   fleetCreate: async (m) => { const f = Object.assign({ members: [] }, m); fleetCache.set(m.id, f); fs.writeFileSync(fltPath(m.id), JSON.stringify(f)); },
   fleetGet: async (fid) => { const f = fleetLoad(fid); return f ? { id: f.id, name: f.name, createdAt: f.createdAt, aisIntervalMin: f.aisIntervalMin } : null; },
@@ -301,6 +302,7 @@ const redisStore = {
   setMeta: async (m) => { await redisCmd(['SET', rMeta(m.id), JSON.stringify(m)]); },
   append: async (id, pts) => { const a = ['RPUSH', rPts(id)]; for (const p of pts) a.push(JSON.stringify(p)); return await redisCmd(a); },
   points: async (id) => { const arr = await redisCmd(['LRANGE', rPts(id), '0', '-1']); return (arr || []).map((x) => JSON.parse(x)); },
+  pointsRemplacer: async (id, pts) => { await redisCmd(['DEL', rPts(id)]); if (!pts.length) return 0; const a = ['RPUSH', rPts(id)]; for (const p of pts) a.push(JSON.stringify(p)); await redisCmd(a); return pts.length; },
   lastPoint: async (id) => { const v = await redisCmd(['LINDEX', rPts(id), '-1']); return v ? JSON.parse(v) : null; },
   fleetCreate: async (m) => { await redisCmd(['SET', rFlt(m.id), JSON.stringify(m)]); },
   fleetGet: async (fid) => { const s = await redisCmd(['GET', rFlt(fid)]); return s ? JSON.parse(s) : null; },
@@ -546,6 +548,167 @@ function surTerreServeur(lat, lon) {
     if ((y1 > lat) !== (y2 > lat) && lon < x1 + (x2 - x1) * (lat - y1) / (y2 - y1)) c = !c;
   }
   return c;
+}
+/* ==================== ARCHIVE LONGUE DUREE ====================
+   Principe : les positions ne sont JAMAIS supprimees. Deux etages :
+     - chaud  : les dernieres 48 h dans le stockage courant (Redis/fichiers),
+                pour l'affichage temps reel ;
+     - froid  : tout le reste ecrit dans un stockage objet S3-compatible
+                (Cloudflare R2, Scaleway, Backblaze...), un fichier gzip par
+                bateau et par mois, immuable une fois clos.
+   Le format d'archive est volontairement simple et auto-descriptif : il doit
+   rester lisible dans dix ans sans ce serveur.
+   Sans variables d'environnement S3, l'archivage est simplement inactif et
+   rien d'autre ne change. */
+
+const S3 = {
+  endpoint: process.env.S3_ENDPOINT || '',       /* https://xxx.r2.cloudflarestorage.com */
+  bucket: process.env.S3_BUCKET || '',
+  cle: process.env.S3_ACCESS_KEY_ID || '',
+  secret: process.env.S3_SECRET_ACCESS_KEY || '',
+  region: process.env.S3_REGION || 'auto'
+};
+const ARCHIVE_ACTIVE = !!(S3.endpoint && S3.bucket && S3.cle && S3.secret);
+let archiveInfo = ARCHIVE_ACTIVE ? 'configuree (' + S3.bucket + ')' : 'inactive (variables S3 absentes)';
+let archiveDernier = '';
+
+/* --- signature AWS Signature V4, sans dependance --- */
+function s3Hash(x) { return crypto.createHash('sha256').update(x).digest('hex'); }
+function s3Hmac(cle, x) { return crypto.createHmac('sha256', cle).update(x).digest(); }
+async function s3Requete(methode, chemin, corps, typeContenu) {
+  const url = new URL(S3.endpoint.replace(/\/$/, '') + '/' + S3.bucket + chemin);
+  const maintenant = new Date();
+  const amzDate = maintenant.toISOString().replace(/[:-]|\.\d{3}/g, '');
+  const dateJour = amzDate.slice(0, 8);
+  const charge = corps || Buffer.alloc(0);
+  const hashCharge = s3Hash(charge);
+  const enTetes = {
+    'host': url.host,
+    'x-amz-content-sha256': hashCharge,
+    'x-amz-date': amzDate
+  };
+  if (typeContenu) enTetes['content-type'] = typeContenu;
+  const clesTriees = Object.keys(enTetes).sort();
+  const enTetesCanon = clesTriees.map((k) => k + ':' + enTetes[k] + '\n').join('');
+  const listeEnTetes = clesTriees.join(';');
+  const requeteCanon = [methode, url.pathname, url.searchParams.toString(), enTetesCanon, listeEnTetes, hashCharge].join('\n');
+  const portee = dateJour + '/' + S3.region + '/s3/aws4_request';
+  const aSigner = ['AWS4-HMAC-SHA256', amzDate, portee, s3Hash(requeteCanon)].join('\n');
+  let k = s3Hmac('AWS4' + S3.secret, dateJour);
+  k = s3Hmac(k, S3.region); k = s3Hmac(k, 's3'); k = s3Hmac(k, 'aws4_request');
+  const signature = crypto.createHmac('sha256', k).update(aSigner).digest('hex');
+  enTetes['authorization'] = 'AWS4-HMAC-SHA256 Credential=' + S3.cle + '/' + portee
+    + ', SignedHeaders=' + listeEnTetes + ', Signature=' + signature;
+  const ac = new AbortController();
+  const tm = setTimeout(() => ac.abort(), 20000);
+  try {
+    const rep = await fetch(url.toString(), {
+      method: methode, headers: enTetes,
+      body: methode === 'GET' || methode === 'HEAD' ? undefined : charge,
+      signal: ac.signal
+    });
+    clearTimeout(tm);
+    return rep;
+  } catch (e) { clearTimeout(tm); throw e; }
+}
+
+/* --- chemin d'archive : un objet par bateau et par mois --- */
+function archiveChemin(bid, annee, mois) {
+  return '/positions/' + bid + '/' + annee + '-' + String(mois).padStart(2, '0') + '.json.gz';
+}
+
+async function archiveLire(bid, annee, mois) {
+  if (!ARCHIVE_ACTIVE) return null;
+  const rep = await s3Requete('GET', archiveChemin(bid, annee, mois));
+  if (rep.status === 404) return null;
+  if (!rep.ok) throw new Error('archive lecture ' + rep.status);
+  const buf = Buffer.from(await rep.arrayBuffer());
+  return JSON.parse(zlib.gunzipSync(buf).toString('utf8'));
+}
+
+async function archiveEcrire(bid, annee, mois, paquet) {
+  const corps = zlib.gzipSync(Buffer.from(JSON.stringify(paquet), 'utf8'), { level: 9 });
+  const rep = await s3Requete('PUT', archiveChemin(bid, annee, mois), corps, 'application/gzip');
+  if (!rep.ok) throw new Error('archive ecriture ' + rep.status + ' ' + (await rep.text()).slice(0, 120));
+  return corps.length;
+}
+/* --- bascule : deplace vers l'archive tout point anterieur a 48 h ---
+   Cette operation est la seule autorisee a retirer des points du stockage
+   chaud, et uniquement APRES confirmation d'ecriture de l'archive. En cas
+   d'echec, rien n'est retire : mieux vaut un Redis qui grossit qu'une donnee
+   perdue (principe du brut immuable). */
+const ARCHIVE_SEUIL_MS = 48 * 3600e3;
+let archiveEnCours = false;
+let archiveStats = { dernierPassage: null, bateaux: 0, pointsArchives: 0, erreurs: 0 };
+
+async function archiveBasculer(force) {
+  if (!ARCHIVE_ACTIVE || archiveEnCours) return archiveStats;
+  archiveEnCours = true;
+  const limite = Date.now() - ARCHIVE_SEUIL_MS;
+  let nBateaux = 0, nPoints = 0, nErreurs = 0;
+  try {
+    const fids = await store.fleetIndex().catch(() => []);
+    const vus = new Set();
+    for (const fid of fids) {
+      const membres = await store.fleetMembers(fid).catch(() => []);
+      for (const bid of membres) {
+        if (vus.has(bid)) continue;
+        vus.add(bid);
+        try {
+          const pts = await store.points(bid);
+          if (!pts.length) continue;
+          const anciens = pts.filter((p) => p[2] < limite);
+          if (anciens.length < 1) continue;
+          /* regrouper par mois UTC */
+          const parMois = new Map();
+          for (const p of anciens) {
+            const d = new Date(p[2]);
+            const cle = d.getUTCFullYear() + '-' + (d.getUTCMonth() + 1);
+            if (!parMois.has(cle)) parMois.set(cle, []);
+            parMois.get(cle).push(p);
+          }
+          let toutOk = true;
+          for (const [cle, lot] of parMois) {
+            const [annee, mois] = cle.split('-').map(Number);
+            try {
+              const existant = await archiveLire(bid, annee, mois);
+              const fusion = existant && existant.points ? existant.points.concat(lot) : lot;
+              /* dedoublonnage par horodatage, ordre chronologique */
+              const parT = new Map();
+              for (const p of fusion) parT.set(p[2], p);
+              const finaux = Array.from(parT.values()).sort((a, b) => a[2] - b[2]);
+              const meta = await store.getMeta(bid).catch(() => null);
+              await archiveEcrire(bid, annee, mois, {
+                v: 1,
+                bateau: bid,
+                nom: meta ? meta.name : null,
+                mmsi: meta ? (meta.mmsi || null) : null,
+                mois: annee + '-' + String(mois).padStart(2, '0'),
+                champs: ['lat', 'lon', 't', 'sog', 'cog'],
+                ecrit: new Date().toISOString(),
+                points: finaux
+              });
+              nPoints += lot.length;
+            } catch (e) {
+              toutOk = false; nErreurs++;
+              archiveDernier = 'echec ' + bid + ' ' + cle + ' : ' + String(e && e.message || e).slice(0, 90);
+            }
+          }
+          /* on ne retire du chaud QUE si toutes les archives du bateau sont ecrites */
+          if (toutOk) {
+            const restants = pts.filter((p) => p[2] >= limite);
+            if (restants.length !== pts.length && typeof store.pointsRemplacer === 'function') {
+              await store.pointsRemplacer(bid, restants);
+              nBateaux++;
+            }
+          }
+        } catch (e) { nErreurs++; }
+      }
+    }
+  } catch (e) { nErreurs++; }
+  archiveEnCours = false;
+  archiveStats = { dernierPassage: new Date().toISOString(), bateaux: nBateaux, pointsArchives: nPoints, erreurs: nErreurs };
+  return archiveStats;
 }
 const store = USE_REDIS ? redisStore : fileStore;
 
@@ -3180,7 +3343,7 @@ boot();
 </html>
 `;
 const ICONS = { '/icon-180.png': Buffer.from('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', 'base64'), '/icon-192.png': Buffer.from('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', 'base64'), '/icon-512.png': Buffer.from('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', 'base64') };
-const BUILD = '30/07 — age des positions';
+const BUILD = '30/07 — archive longue duree';
 const LEAFLET_JS = `/* @preserve
  * Leaflet 1.9.4, a JS library for interactive maps. https://leafletjs.com
  * (c) 2010-2023 Vladimir Agafonkin, (c) 2010-2011 CloudMade
@@ -3939,6 +4102,10 @@ const server = http.createServer(async (req, res) => {
           'Positions retenues : ' + aisPosOk + ' — ecartees : ' + aisRejetInconnu + ' hors liste, ' + aisRejetCoord + ' sans coordonnees',
           'Stockage : ' + (stockErreurs ? stockErreurs + ' erreur(s) — ' + stockDerniereErreur : 'aucune erreur'),
           'API : ' + (apiErreurs ? apiErreurs + ' erreur(s) — ' + apiDerniereErreur : 'aucune erreur'),
+          'Archive longue duree : ' + archiveInfo
+            + (archiveStats.dernierPassage ? ' — dernier passage ' + archiveStats.dernierPassage.slice(11, 16)
+               + ' UTC : ' + archiveStats.pointsArchives + ' point(s) archive(s), ' + archiveStats.erreurs + ' erreur(s)' : '')
+            + (archiveDernier ? ' — ' + archiveDernier : ''),
           'Trait de cote (fleches/routeur) : ' + terreInfo,
           'Courants 2D Shom : ' + c2dInfo + (mareeDerniereErreur ? ' — maree : derniere erreur ' + mareeDerniereErreur : ' — maree : ' + (mareeCache.size ? mareeCache.size + ' port(s) en cache' : 'pas encore interrogee')),
           'Meteo OWM : ' + (process.env.OWM_API_KEY ? 'cle presente' : 'absente')
@@ -4114,6 +4281,11 @@ const server = http.createServer(async (req, res) => {
         return json(res, 200, { id: fid, name: f.name });
       }
 
+      if (p === '/api/admin/archive' && req.method === 'POST') {
+        if (!ARCHIVE_ACTIVE) return json(res, 503, { error: 'archivage non configure (variables S3 absentes)' });
+        const st = await archiveBasculer(true);
+        return json(res, 200, { ok: true, ...st, dernierMessage: archiveDernier || null });
+      }
       if (p === '/api/admin/suivi' && req.method === 'POST') {
         let body; try { body = await readBody(req); } catch { return json(res, 400, { error: 'json' }); }
         const ids = Array.isArray(body.ids) ? body.ids.filter((x) => /^[a-f0-9]{16}$/.test(String(x))) : [];
@@ -4461,6 +4633,46 @@ const server = http.createServer(async (req, res) => {
        (cap moyen suivi). Le gain/perte se mesure sur la meme fenetre doublee.
        Tout est calcule a partir des traces deja stockees : aucune donnee
        nouvelle, aucun appel externe. */
+    /* Historique complet d'un bateau : archive froide + points chauds, fusionnes
+       et ordonnes. C'est l'entree unique pour toute analyse sur la duree. */
+    const mHist = p.match(/^\/api\/boats\/([a-f0-9]{16})\/historique$/);
+    if (mHist && req.method === 'GET') {
+      const bid = mHist[1];
+      const meta = await store.getMeta(bid);
+      if (!meta) return json(res, 404, { error: 'bateau introuvable' });
+      const depuis = u.searchParams.get('depuis') ? Date.parse(u.searchParams.get('depuis')) : null;
+      const jusqua = u.searchParams.get('jusqua') ? Date.parse(u.searchParams.get('jusqua')) : null;
+      if ((depuis !== null && !isFinite(depuis)) || (jusqua !== null && !isFinite(jusqua)))
+        return json(res, 400, { error: 'dates invalides (ISO 8601 attendu)' });
+      const t0h = depuis !== null ? depuis : Date.now() - 30 * 86400e3;
+      const t1h = jusqua !== null ? jusqua : Date.now();
+      if (t1h - t0h > 400 * 86400e3) return json(res, 400, { error: 'periode trop longue (400 jours maximum par requete)' });
+      const tous = [];
+      let moisLus = 0, archiveDispo = ARCHIVE_ACTIVE;
+      if (ARCHIVE_ACTIVE) {
+        const d0 = new Date(t0h), d1 = new Date(t1h);
+        let an = d0.getUTCFullYear(), mo = d0.getUTCMonth() + 1;
+        while (an < d1.getUTCFullYear() || (an === d1.getUTCFullYear() && mo <= d1.getUTCMonth() + 1)) {
+          try {
+            const paquet = await archiveLire(bid, an, mo);
+            if (paquet && paquet.points) { tous.push(...paquet.points); moisLus++; }
+          } catch { archiveDispo = false; }
+          mo++; if (mo > 12) { mo = 1; an++; }
+        }
+      }
+      const chauds = await store.points(bid);
+      tous.push(...chauds);
+      const parT = new Map();
+      for (const q of tous) if (q[2] >= t0h && q[2] <= t1h) parT.set(q[2], q);
+      const points = Array.from(parT.values()).sort((a, b) => a[2] - b[2]);
+      return json(res, 200, {
+        bateau: bid, nom: meta.name, mmsi: meta.mmsi || null,
+        depuis: new Date(t0h).toISOString(), jusqua: new Date(t1h).toISOString(),
+        moisArchivesLus: moisLus, archive: archiveDispo ? 'ok' : 'indisponible',
+        champs: ['lat', 'lon', 't', 'sog', 'cog'],
+        n: points.length, points: points
+      }, req);
+    }
     const mAnalyse = p.match(/^\/api\/fleets\/([a-f0-9]{16})\/analyse$/);
     if (mAnalyse && req.method === 'GET') {
       const fid = mAnalyse[1];
@@ -5204,4 +5416,9 @@ async function aisRefresh(reconnect) {
   if (reconnect) aisConnect();
 }
 
+/* bascule automatique : au demarrage (differee) puis toutes les heures */
+if (ARCHIVE_ACTIVE) {
+  setTimeout(() => { archiveBasculer(false).catch(() => {}); }, 120000);
+  setInterval(() => { archiveBasculer(false).catch(() => {}); }, 3600e3);
+}
 server.listen(PORT, () => { console.log('Sea Tracker (' + (USE_REDIS ? 'Upstash Redis' : 'fichiers') + ') sur http://localhost:' + PORT); if (AIS_KEY || VAPI_KEY) aisRefresh(!!AIS_KEY); });
