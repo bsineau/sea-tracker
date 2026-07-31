@@ -2515,7 +2515,9 @@ function renderLegend(){
       var cp=(b.last&&b.last[4]!=null)?(Math.round(b.last[4])+'°'):'';
       right=(cp?(sp+' · '+cp):sp)+(b.last?' · '+fmtAgeCourt(b.last[2]):'');
     } else right=(b.last?'vu '+fmtAge(b.last[2]):'—');
-    html+='<div class="lgi'+(on?'':' off')+'" data-id="'+k+'"><span class="dot" style="background:'+(on?b.color:'#6b7f8c')+'"></span><span>'+esc(b.name)+'</span><span class="sp'+(on?'':' offsp')+'">'+right+'</span>'+(ADMK?'<span class="del" data-del="'+k+'" title="Retirer de la flotte">✕</span>':'')+'</div>';});
+    html+='<div class="lgi'+(on?'':' off')+'" data-id="'+k+'"><span class="dot" style="background:'+(on?b.color:'#6b7f8c')+'"></span><span>'+esc(b.name)+'</span><span class="sp'+(on?'':' offsp')+'">'+right+'</span>'
+      +'<a class="del" href="/b?id='+k+'" title="Fiche du bateau" style="text-decoration:none">\u2139\ufe0e</a>'
+      +(ADMK?'<span class="del" data-del="'+k+'" title="Retirer de la flotte">✕</span>':'')+'</div>';});
   html+='<div class="lgexp">⤓ Traces flotte : <a href="/api/fleets/'+fid+'/export?format=gpx">GPX</a> · <a href="/api/fleets/'+fid+'/export?format=csv">CSV</a></div>';
   el.innerHTML=html;
   var tg=$('lgtog');
@@ -2603,6 +2605,114 @@ map.on('click',function(e){
 </body>
 </html>
 `;
+const PAGE_FICHE = `<!DOCTYPE html>
+<html lang="fr"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<title>Fiche bateau — Sea Tracker</title>
+<link rel="stylesheet" href="/vendor/leaflet.css">
+<style>
+ :root{color-scheme:dark}
+ body{margin:0;background:#0b1a26;color:#dfeaf2;font:15px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;
+      padding:max(12px,env(safe-area-inset-top)) 12px calc(12px + env(safe-area-inset-bottom))}
+ h1{font-size:20px;margin:6px 0 2px}
+ .sub{color:#8fb0c4;font-size:13px;margin-bottom:14px}
+ .card{background:#0d1f2d;border:1px solid #1d3a52;border-radius:14px;padding:12px;margin-bottom:12px}
+ .lbl{color:#39c0d3;font-size:11px;letter-spacing:.08em;text-transform:uppercase;margin-bottom:8px}
+ .grille{display:grid;grid-template-columns:1fr 1fr;gap:10px}
+ .stat{background:#0f2233;border-radius:10px;padding:10px}
+ .stat b{display:block;font-size:22px;font-variant-numeric:tabular-nums}
+ .stat span{color:#8fb0c4;font-size:11px}
+ select,button{background:#0f2233;color:#dfeaf2;border:1px solid #1d3a52;border-radius:9px;padding:7px 10px;font-size:14px}
+ #carte{height:46vh;border-radius:12px;border:1px solid #1d3a52}
+ table{width:100%;border-collapse:collapse;font-variant-numeric:tabular-nums}
+ td,th{padding:4px 6px;border-bottom:1px solid #14293c;text-align:right;font-size:13px}
+ th{color:#39c0d3;font-weight:600}
+ td:first-child,th:first-child{text-align:left}
+ .barre{height:9px;background:#0f2233;border-radius:5px;overflow:hidden}
+ .barre i{display:block;height:100%;background:#39c0d3}
+ a{color:#39c0d3}
+</style></head><body>
+<div><a href="javascript:history.back()">‹ Retour</a></div>
+<h1 id="nom">…</h1>
+<div class="sub" id="sub"></div>
+<div class="card">
+  <label class="lbl">Période</label>
+  <select id="jours">
+    <option value="7">7 jours</option>
+    <option value="30">30 jours</option>
+    <option value="90" selected>90 jours</option>
+    <option value="365">1 an</option>
+    <option value="400">tout (400 j max)</option>
+  </select>
+</div>
+<div id="corps"></div>
+<script src="/vendor/leaflet.js"></script>
+<script>
+(function(){
+  var bid=new URLSearchParams(location.search).get('id')||'';
+  var carte=null, traceL=null;
+  function esc(s){return String(s==null?'':s).replace(/[&<>"]/g,function(c){return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c];});}
+  function nb(v,u){return (v===null||v===undefined)?'—':(String(v).replace('.',',')+(u||''));}
+  function charger(){
+    var j=document.getElementById('jours').value;
+    fetch('/api/boats/'+bid+'/fiche?jours='+j).then(function(r){return r.json();})
+      .then(function(d){ try{ rendre(d); }catch(e){ document.getElementById('corps').innerHTML='<div class="card">Affichage partiel : '+esc(e.message||'erreur')+'</div>'; } })
+      .catch(function(){document.getElementById('corps').innerHTML='<div class="card">Fiche indisponible (serveur injoignable).</div>';});
+  }
+  function rendre(d){
+    if(d.error){document.getElementById('corps').innerHTML='<div class="card">'+esc(d.error)+'</div>';return;}
+    document.getElementById('nom').textContent=d.nom||'Bateau';
+    document.getElementById('sub').textContent=(d.mmsi?('MMSI '+d.mmsi+' · '):'')+d.n+' position'+(d.n>1?'s':'')+' enregistrée'+(d.n>1?'s':'');
+    if(d.vide){document.getElementById('corps').innerHTML='<div class="card">Pas encore assez de positions sur cette période.</div>';return;}
+    var h='';
+    h+='<div class="card"><div class="lbl">Bilan</div><div class="grille">'
+      +'<div class="stat"><b>'+nb(d.distanceNm)+'</b><span>milles parcourus</span></div>'
+      +'<div class="stat"><b>'+nb(d.heuresNav)+' h</b><span>en navigation</span></div>'
+      +'<div class="stat"><b>'+nb(d.vitesseMoyenne)+' kt</b><span>vitesse moyenne</span></div>'
+      +'<div class="stat"><b>'+nb(d.vitesseMax)+' kt</b><span>vitesse maximale</span></div>'
+      +'<div class="stat"><b>'+nb(d.sorties)+'</b><span>sortie'+(d.sorties>1?'s':'')+' détectée'+(d.sorties>1?'s':'')+'</span></div>'
+      +'<div class="stat"><b>'+(d.plusLongue?nb(d.plusLongue.distance):'—')+'</b><span>plus longue (MN)</span></div>'
+      +'</div></div>';
+    h+='<div class="card"><div class="lbl">Trace</div><div id="carte"></div></div>';
+    var hist=d.histogrammeVitesse||[], tot=hist.reduce(function(a,b){return a+b;},0);
+    if(tot>0){
+      h+='<div class="card"><div class="lbl">Temps passé par vitesse</div><table>';
+      for(var i=0;i<hist.length;i++){
+        if(hist[i]<=0) continue;
+        var pc=Math.round(hist[i]/tot*100);
+        h+='<tr><td>'+i+'–'+(i+1)+(i===15?'+':'')+' kt</td><td style="width:52%"><div class="barre"><i style="width:'+pc+'%"></i></div></td><td>'+nb(hist[i],' h')+'</td><td>'+pc+' %</td></tr>';
+      }
+      h+='</table></div>';
+    }
+    if(d.parMois&&d.parMois.length){
+      h+='<div class="card"><div class="lbl">Par mois</div><table><tr><th>Mois</th><th>Milles</th><th>Heures</th></tr>';
+      d.parMois.forEach(function(m){h+='<tr><td>'+esc(m.mois)+'</td><td>'+nb(m.distance)+'</td><td>'+nb(m.heures)+'</td></tr>';});
+      h+='</table></div>';
+    }
+    h+='<div class="card"><div class="lbl">Période couverte</div>'+esc((d.premier||'').slice(0,16).replace('T',' '))+' → '+esc((d.dernier||'').slice(0,16).replace('T',' '))+' UTC</div>';
+    document.getElementById('corps').innerHTML=h;
+    /* carte : trace allegee. Isolee : si Leaflet manque ou echoue, les
+       statistiques restent affichees (regle R3). */
+    try{
+      if(window.L&&d.trace&&d.trace.length>1){
+        carte=L.map('carte',{zoomControl:false});
+        L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png',{maxZoom:18,attribution:'© OpenStreetMap'}).addTo(carte);
+        traceL=L.polyline(d.trace,{color:'#39c0d3',weight:3,opacity:.9}).addTo(carte);
+        carte.fitBounds(traceL.getBounds(),{padding:[18,18]});
+        L.circleMarker(d.trace[d.trace.length-1],{radius:6,color:'#fff',fillColor:'#f59e0b',fillOpacity:1,weight:2}).addTo(carte);
+      } else {
+        var z=document.getElementById('carte');
+        if(z) z.innerHTML='<div style="padding:14px;color:#8fb0c4;font-size:13px">Carte indisponible.</div>';
+      }
+    }catch(e){
+      var z2=document.getElementById('carte');
+      if(z2) z2.innerHTML='<div style="padding:14px;color:#8fb0c4;font-size:13px">Carte indisponible.</div>';
+    }
+  }
+  document.getElementById('jours').onchange=charger;
+  charger();
+})();
+</script></body></html>`;
 const PAGE_JOIN = `<!DOCTYPE html>
 <html lang="fr">
 <head><link rel="manifest" href="__MANIFEST__"><meta name="apple-mobile-web-app-capable" content="yes"><meta name="mobile-web-app-capable" content="yes"><meta name="apple-mobile-web-app-status-bar-style" content="black-translucent"><meta name="apple-mobile-web-app-title" content="Sea Tracker"><meta name="theme-color" content="#0a1a26"><link rel="apple-touch-icon" href="/icon-180.png"><link rel="icon" href="/icon-192.png"><script>if("serviceWorker" in navigator)window.addEventListener("load",function(){navigator.serviceWorker.register("/sw.js").catch(function(){});});</script>
@@ -3343,7 +3453,7 @@ boot();
 </html>
 `;
 const ICONS = { '/icon-180.png': Buffer.from('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', 'base64'), '/icon-192.png': Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAMAAAADACAIAAADdvvtQAAAHIElEQVR42u2dPY5eNRSG7zimSU+TFpRuQBQ0bIOOhbAIFoEQCETDNiKkFFGUNlkBS4hmhiLJMAqZbz7b59/Pqymm+H6ujx+/59j3s+/F4ydPD4Rm1QgBAiAEQAiAEAAhBEAIgBAAIQBCCIAQACEAQgCEEAAhAEKR1AnBh6E0PpaurwlbhxXhz9mMqg40il+0AUwdaIAJgIJxc/qqapHU4QaStgeotcSXnRyjDjpgtCVArdYSaFqMOuiA0TYAtT1uvKTCqIMOGC1dJvTQ9roO1PixQHQratCDFZVzINDJY0Udem510R6d/+Kb6yu3+ERiqG9LzxAu57zdDqlIDPWt0FmE5vwPV4cpTDrrO9Cjys3pb9QlKYAV9cL02HPjQJI3Q70kPRHQ+eQlqWDkylCvRI84N29ePb/9/4vLb+Makh9DvQY9AS3H2pCcGGrQE6FCSjSTDeBAcu3Mi46WFZn7UE9KTwF0tDCyZahBT8GMZpjLGvTAUIYUJtGe2ujIpzOTXNa2G5qzursmtEN7IwG0bD9BopmPIf1E1qFn6LsU70jc83Wr36WcyNrm9Fy0R3f/Ln/5/fTrX7/8+//v2tmH4tZAen1zX98/SM9dhs75wPihiA3QAvh5e0IVo4Am1ALSo2c5J15zpv3cZ0IT32juFS0VQDHqHr1efJAhjQsImMhaNNilYjTUc0P248txtETWqtJz/oun6TnThHxbp81QrEol3YRlgiGpZhZNYbOAe4VVO3mFaqyGCdXZROw1KEdNKGw5HAAgJ/uZzgtS9jPNkPjuWHsTatmdY/rtLskrTvPjATQFdfbwLZqQZxCETChxDbQSdw37cWQovwOZ20+9Xyc6REPChNpusX7Yflr778/QhJKOCgmAbO1Hl560Y8PLhFpGC4msRRNKF9VlgGx/tpHCfpIlsrUebIkGyibbenKFaKNtPZbVz3oi22NbT57zeO1rZ8diyLIfrQmYG1irw7GlPMXGJ1b1Utg6PZc//+YzI3vxzIWhJACNh8YhHN5Jdp0hI+xmLzK6A63/fNPLfqQ4Dm5CxZ/+F4Ge1y+e5ZpwBAVoYiQF+dWmO0OmoTMCqCV4TlSI5JUwbqSwiHpvQqSw6CYc2H5WElnYLNZrDQcxenSjH+yZX+YOpJ/IHeeuqlsTVxKZRUzGe7ZQDRS5dq47q0//mDfkG/kqDpTEfuqZUKnzgVLQs1IMbXM+ENpGJQCKc9N01ITyZ7E211vRlI6e9Vl9kJl85RUdZBD/VqDBSe3nvQk5nZNHDRQ6paoyBEBUP8zCgtATe6P7DibEOhAM7QpQGfshhaF9TSgrQFXtJx1DDXoQKQwTAiDsJydDOBDaCaB9qp8sJhQOoBNPuaZ2PgyfOB4FoGgN3s2EtOM/DpDTjrg97cchkQ32L0U02qCI3rn6CV5NRwToo7RN7XzLUMCCkhSGwgO0Mm6wn5VEZuBYOBDFkD1A+jP5d0PHxX5urq/2Xbsa79m4DuSbvGJi9ObV802LaNaj7RmyiXlQB/rq1z9hpfQsrMoRf7VNyKBP7RzofEfFftYZMqsZwqUw6NkjhSFmZKsAjafMB30V+xFhaCZ/zRa1OBBKlcJODA7sR8SEjJfcLh4/ebpGoNFzC2UOVhq82rtH0H35zXcGGWEdBcv8lSmFyQwsm+UrP3q2mIVNh0aMIT2MhD7cOUSmANkuSYsFSBwjuQ+0hmDtspdroMPuAViSxZBEE5TGj7X9rDWhyyA83gE311dzKEy/8dwgPtgWTdPNRc+R9IFzKgw5JeWMhbMCQCMm9M9Pbz/8+/ZAovr8x8+Mh0qL3kgUO7ByAI3gDEP+9Ahlau6FoTgAYUKb2Y+zA8FQgTBKAzSINgw50CO6TtE2H0B4TzyAxgGHITt6pJdJdRyITT8xpdAvLfd4wn4KpjAS2R7JS9+BYKg6PUfAlWgYyhUcZYCmwIch4bBozmn0HYgZWbmZl3kKoxgqV/rErYFgKFcorACiGKpV+ng4EAyVo8c8hcFQLXo8aiAmZbUi3FK0cEMTCjvtijELg6ES9BwyW5vn6RXGV3G3obTk9xA61QauO1On9kSf0ythSdLae+pXWXpvbZZm6G4/hcJIcduy67wkwN54HYaCGJL6dnfvWW2MwxXUGPIiyeiYhABrImFO53gXi9bM+lUcJtOzNcIspwU73kXZik739xBSnkexRFqMjXc+kCFDgZjISc8R9IApk3SWTyHvAjXiBT3+DvT1H3/Rxen08ofvSzsQyiAAQktyvZk6yXx16FMVfz1rfEtilHDe0HPHugxGaaecvULcU2OUfLWi1xm+6TAqsdBVAqCP+iM4SbUWSPtRTzFJKrqw3o/CGnoGD9AAUAiYNruF148N9ck+nqCK272bAgQNcuJeGAIgBEAIgBAAIQRACIAQACEAQgiAEAAhAEIAhBAAIWn9C9MBrxKmJhT1AAAAAElFTkSuQmCC', 'base64'), '/icon-512.png': Buffer.from('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', 'base64') };
-const BUILD = '30/07 — archive longue duree';
+const BUILD = '30/07 — fiche bateau v2';
 const LEAFLET_JS = `/* @preserve
  * Leaflet 1.9.4, a JS library for interactive maps. https://leafletjs.com
  * (c) 2010-2023 Vladimir Agafonkin, (c) 2010-2011 CloudMade
@@ -4635,6 +4745,96 @@ const server = http.createServer(async (req, res) => {
        nouvelle, aucun appel externe. */
     /* Historique complet d'un bateau : archive froide + points chauds, fusionnes
        et ordonnes. C'est l'entree unique pour toute analyse sur la duree. */
+    /* Fiche d'un bateau : statistiques agregees sur tout son historique
+       (archive + chaud). Tout est calcule ici, jamais dans la page : la fiche
+       doit rester lisible sur un telephone sans transferer 100 000 points. */
+    const mFiche = p.match(/^\/api\/boats\/([a-f0-9]{16})\/fiche$/);
+    if (mFiche && req.method === 'GET') {
+      const bid = mFiche[1];
+      const meta = await store.getMeta(bid);
+      if (!meta) return json(res, 404, { error: 'bateau introuvable' });
+      const jours = Math.min(400, Math.max(1, parseInt(u.searchParams.get('jours'), 10) || 90));
+      const t0f = Date.now() - jours * 86400e3;
+
+      /* rassembler l'historique : archive mensuelle + points chauds */
+      const tous = [];
+      if (ARCHIVE_ACTIVE) {
+        const d0 = new Date(t0f), d1 = new Date();
+        let an = d0.getUTCFullYear(), mo = d0.getUTCMonth() + 1;
+        while (an < d1.getUTCFullYear() || (an === d1.getUTCFullYear() && mo <= d1.getUTCMonth() + 1)) {
+          try { const pk = await archiveLire(bid, an, mo); if (pk && pk.points) tous.push(...pk.points); } catch {}
+          mo++; if (mo > 12) { mo = 1; an++; }
+        }
+      }
+      tous.push(...(await store.points(bid)));
+      const parT = new Map();
+      for (const q of tous) if (q[2] >= t0f) parT.set(q[2], q);
+      const pts = Array.from(parT.values()).sort((a, b) => a[2] - b[2]);
+      if (pts.length < 2) return json(res, 200, { bateau: bid, nom: meta.name, mmsi: meta.mmsi || null, jours: jours, n: pts.length, vide: true }, req);
+
+      const R_NM = 3440.065, RAD = Math.PI / 180;
+      const dNm = (a, b) => {
+        const dp = (b[0] - a[0]) * RAD, dl = (b[1] - a[1]) * RAD;
+        const h = Math.sin(dp / 2) ** 2 + Math.cos(a[0] * RAD) * Math.cos(b[0] * RAD) * Math.sin(dl / 2) ** 2;
+        return 2 * R_NM * Math.asin(Math.sqrt(h));
+      };
+      /* Une « sortie » = suite de points separes de moins de 6 h. Un saut plus
+         long signifie que le bateau n'emettait pas : on ne compte ni la
+         distance ni le temps de ces trous, sinon les chiffres seraient faux. */
+      const TROU_MS = 6 * 3600e3;
+      let distTot = 0, tempsNavMs = 0, vMax = 0;
+      const sorties = [];
+      let debutSortie = pts[0], distSortie = 0, precedent = pts[0];
+      const histVitesse = new Array(16).fill(0);   /* 0-1, 1-2 ... 15+ noeuds */
+      let nMesures = 0, sommeV = 0;
+      const parMois = new Map();
+
+      for (let i = 1; i < pts.length; i++) {
+        const a = pts[i - 1], b = pts[i];
+        const dt = b[2] - a[2];
+        if (dt > TROU_MS || dt <= 0) {
+          if (distSortie > 0.5) sorties.push({ debut: debutSortie[2], fin: a[2], distance: Math.round(distSortie * 10) / 10 });
+          debutSortie = b; distSortie = 0; precedent = b; continue;
+        }
+        const d = dNm(a, b);
+        if (d > 60) { precedent = b; continue; }        /* saut aberrant : ignore */
+        distTot += d; distSortie += d; tempsNavMs += dt;
+        const v = d / (dt / 3600e3);
+        if (isFinite(v) && v < 40) {
+          vMax = Math.max(vMax, v);
+          histVitesse[Math.min(15, Math.floor(v))] += dt / 3600e3;
+          sommeV += v * (dt / 3600e3); nMesures += dt / 3600e3;
+        }
+        const cle = new Date(b[2]).toISOString().slice(0, 7);
+        const m = parMois.get(cle) || { mois: cle, distance: 0, heures: 0 };
+        m.distance += d; m.heures += dt / 3600e3;
+        parMois.set(cle, m);
+        precedent = b;
+      }
+      if (distSortie > 0.5) sorties.push({ debut: debutSortie[2], fin: pts[pts.length - 1][2], distance: Math.round(distSortie * 10) / 10 });
+
+      const mois = Array.from(parMois.values()).map((m) => ({ mois: m.mois, distance: Math.round(m.distance), heures: Math.round(m.heures) })).sort((a, b) => a.mois < b.mois ? -1 : 1);
+      /* trace allegee pour l'affichage : au plus 800 points */
+      const pas = Math.max(1, Math.ceil(pts.length / 800));
+      const trace = [];
+      for (let i = 0; i < pts.length; i += pas) trace.push([Math.round(pts[i][0] * 1e4) / 1e4, Math.round(pts[i][1] * 1e4) / 1e4]);
+
+      return json(res, 200, {
+        bateau: bid, nom: meta.name, mmsi: meta.mmsi || null, jours: jours,
+        n: pts.length,
+        premier: new Date(pts[0][2]).toISOString(),
+        dernier: new Date(pts[pts.length - 1][2]).toISOString(),
+        distanceNm: Math.round(distTot),
+        heuresNav: Math.round(tempsNavMs / 3600e3),
+        vitesseMoyenne: nMesures > 0 ? Math.round(sommeV / nMesures * 100) / 100 : null,
+        vitesseMax: Math.round(vMax * 10) / 10,
+        sorties: sorties.length,
+        plusLongue: sorties.length ? sorties.slice().sort((a, b) => b.distance - a.distance)[0] : null,
+        histogrammeVitesse: histVitesse.map((h) => Math.round(h * 10) / 10),
+        parMois: mois,
+        trace: trace
+      }, req);
+    }
     const mHist = p.match(/^\/api\/boats\/([a-f0-9]{16})\/historique$/);
     if (mHist && req.method === 'GET') {
       const bid = mHist[1];
@@ -5096,6 +5296,7 @@ const server = http.createServer(async (req, res) => {
       res.writeHead(200, { 'Content-Type': 'application/json', 'Cache-Control': 'public, max-age=86400' }); return res.end(zlib.gunzipSync(brutT));
     } catch { res.writeHead(404); return res.end('terre.json.gz absent'); }
   }
+  if (p === '/b') return serveHTML(res, PAGE_FICHE, req.url);
   if (p === '/carte.js') { res.writeHead(200, { 'Content-Type': 'text/javascript; charset=utf-8', 'Cache-Control': 'no-store' }); return res.end(PAGE_CARTEJS); }
   if (p === '/config.js') { res.writeHead(200, { 'Content-Type': 'text/javascript; charset=utf-8', 'Cache-Control': 'no-store' }); return res.end('window.OWM_KEY=' + JSON.stringify(process.env.OWM_API_KEY || '') + ';'); }
   if (p === '/') return serveHTML(res, PAGE_INDEX, req.url);
