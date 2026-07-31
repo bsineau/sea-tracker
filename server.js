@@ -454,13 +454,25 @@ const CORRECTION_MAREE_MIN = {
 };
 const mareeCache = new Map(); /* port -> { t, evts: [{t, type, h}] } */
 let mareeDerniereErreur = '';
-async function mareeEvenements(port) {
+async function mareeEvenements(port, tCible) {
   const pos = PORTS_MAREE[port];
   if (!pos) return null;
-  const e = mareeCache.get(port);
-  if (e && Date.now() - e.t < 6 * 3600e3) return e.evts;
+  /* Deux regimes : le present (previsions glissantes, cache 6 h) et le passe
+     (archive de niveau de mer autour d'une date, cache permanent par jour).
+     Sans ce second regime, aucune correction de courant n'est possible sur
+     l'historique — donc pas de polaire observee corrigee. */
+  const ancien = tCible !== undefined && Math.abs(Date.now() - tCible) > 20 * 3600e3;
+  const cle = ancien ? (port + '|' + new Date(tCible).toISOString().slice(0, 10)) : port;
+  const e = mareeCache.get(cle);
+  if (e && (ancien || Date.now() - e.t < 6 * 3600e3)) return e.evts;
   try {
-    const url = 'https://marine-api.open-meteo.com/v1/marine?latitude=' + pos[0] + '&longitude=' + pos[1]
+    let url;
+    if (ancien) {
+      const j0 = new Date(tCible - 36 * 3600e3).toISOString().slice(0, 10);
+      const j1 = new Date(tCible + 36 * 3600e3).toISOString().slice(0, 10);
+      url = 'https://marine-api.open-meteo.com/v1/marine?latitude=' + pos[0] + '&longitude=' + pos[1]
+        + '&hourly=sea_level_height_msl&start_date=' + j0 + '&end_date=' + j1 + '&timezone=UTC';
+    } else url = 'https://marine-api.open-meteo.com/v1/marine?latitude=' + pos[0] + '&longitude=' + pos[1]
       + '&hourly=sea_level_height_msl&past_days=1&forecast_days=7&timezone=UTC';
     const ac = new AbortController();
     const tm = setTimeout(() => ac.abort(), 7000);
@@ -481,7 +493,8 @@ async function mareeEvenements(port) {
       const hSommet = hs[i] - (hs[i - 1] - hs[i + 1]) * frac / 4;
       evts.push({ t: t0 + frac * 3600e3, type: max ? 'PM' : 'BM', h: Math.round(hSommet * 100) / 100 });
     }
-    mareeCache.set(port, { t: Date.now(), evts });
+    mareeCache.set(cle, { t: Date.now(), evts });
+    if (mareeCache.size > 800) { const it = mareeCache.keys(); for (let i = 0; i < 100; i++) mareeCache.delete(it.next().value); }
     return evts;
   } catch (err) {
     mareeDerniereErreur = (port + ' : ' + String(err && err.message || err)).slice(0, 120);
@@ -489,7 +502,7 @@ async function mareeEvenements(port) {
   }
 }
 async function coefficientA(t) {
-  const evts = await mareeEvenements('Brest');
+  const evts = await mareeEvenements('Brest', t);
   if (!evts) return null;
   const pms = evts.filter((e2) => e2.type === 'PM');
   if (!pms.length) return null;
@@ -504,7 +517,7 @@ async function coefficientA(t) {
 }
 /* evenement de reference (PM ou BM selon la zone) le plus proche de t */
 async function phasePour(port, base, t) {
-  const evts = await mareeEvenements(port);
+  const evts = await mareeEvenements(port, t);
   if (!evts) return null;
   const bons = evts.filter((e2) => e2.type === base);
   if (!bons.length) return null;
@@ -709,6 +722,64 @@ async function archiveBasculer(force) {
   archiveEnCours = false;
   archiveStats = { dernierPassage: new Date().toISOString(), bateaux: nBateaux, pointsArchives: nPoints, erreurs: nErreurs };
   return archiveStats;
+}
+/* ==================== VENT ARCHIVE ====================
+   Pour reconstruire la polaire observee d'un bateau, il faut le vent qu'il
+   faisait a l'endroit et a l'heure de chaque segment de trace. Open-Meteo
+   fournit un service d'archive gratuit. On l'interroge par maille de 0,25 deg
+   et par tranche de 24 h, et on garde le resultat en cache : sans cela, une
+   seule polaire declencherait des milliers d'appels.
+   Le cache est en memoire (perdu au redemarrage) : c'est acceptable, le
+   recalcul est simplement plus lent la premiere fois. */
+const ventArchiveCache = new Map();     /* cle maille|jour -> {temps:[], s:[], d:[]} */
+let ventArchiveAppels = 0, ventArchiveErreurs = 0;
+
+function ventCleMaille(lat, lon, jourISO) {
+  return (Math.round(lat * 4) / 4).toFixed(2) + '|' + (Math.round(lon * 4) / 4).toFixed(2) + '|' + jourISO;
+}
+
+async function ventArchive(lat, lon, tMs) {
+  const jour = new Date(tMs).toISOString().slice(0, 10);
+  const cle = ventCleMaille(lat, lon, jour);
+  let bloc = ventArchiveCache.get(cle);
+  if (bloc === undefined) {
+    const la = Math.round(lat * 4) / 4, lo = Math.round(lon * 4) / 4;
+    try {
+      ventArchiveAppels++;
+      const url = 'https://archive-api.open-meteo.com/v1/archive?latitude=' + la + '&longitude=' + lo
+        + '&start_date=' + jour + '&end_date=' + jour
+        + '&hourly=wind_speed_10m,wind_direction_10m&wind_speed_unit=kn&timezone=UTC';
+      const ac = new AbortController();
+      const tm = setTimeout(() => ac.abort(), 15000);
+      const rep = await fetch(url, { signal: ac.signal });
+      clearTimeout(tm);
+      const d = await rep.json();
+      if (d && d.hourly && d.hourly.time) {
+        bloc = { temps: d.hourly.time, s: d.hourly.wind_speed_10m, d: d.hourly.wind_direction_10m };
+      } else bloc = null;
+    } catch { ventArchiveErreurs++; bloc = null; }
+    ventArchiveCache.set(cle, bloc);
+    if (ventArchiveCache.size > 4000) {          /* garde-fou memoire */
+      const it = ventArchiveCache.keys();
+      for (let i = 0; i < 500; i++) ventArchiveCache.delete(it.next().value);
+    }
+  }
+  if (!bloc) return null;
+  /* interpolation lineaire entre les deux heures encadrantes */
+  const h = new Date(tMs).getUTCHours();
+  const frac = (tMs - Date.parse(jour + 'T' + String(h).padStart(2, '0') + ':00:00Z')) / 3600e3;
+  const i0 = h, i1 = Math.min(bloc.temps.length - 1, h + 1);
+  const s0 = bloc.s[i0], s1 = bloc.s[i1], d0 = bloc.d[i0], d1 = bloc.d[i1];
+  if (s0 === null || s0 === undefined || d0 === null || d0 === undefined) return null;
+  const tws = (s1 === null || s1 === undefined) ? s0 : s0 + (s1 - s0) * frac;
+  let twd;
+  if (d1 === null || d1 === undefined) twd = d0;
+  else {
+    const a0 = d0 * Math.PI / 180, a1 = d1 * Math.PI / 180;
+    twd = (Math.atan2(Math.sin(a0) * (1 - frac) + Math.sin(a1) * frac,
+                      Math.cos(a0) * (1 - frac) + Math.cos(a1) * frac) * 180 / Math.PI + 360) % 360;
+  }
+  return { tws: tws, twd: twd };
 }
 const store = USE_REDIS ? redisStore : fileStore;
 
@@ -2684,6 +2755,9 @@ const PAGE_FICHE = `<!DOCTYPE html>
       }
       h+='</table></div>';
     }
+    h+='<div class="card"><div class="lbl">Polaire observée</div>'
+      +'<div style="color:#8fb0c4;font-size:12px;margin-bottom:8px">Reconstruite depuis les traces : vitesse mesurée, corrigée du courant de marée, croisée avec le vent archivé. Se remplit à mesure des navigations.</div>'
+      +'<button id="polGo">Calculer la polaire</button><div id="polOut" style="margin-top:10px"></div></div>';
     if(d.parMois&&d.parMois.length){
       h+='<div class="card"><div class="lbl">Par mois</div><table><tr><th>Mois</th><th>Milles</th><th>Heures</th></tr>';
       d.parMois.forEach(function(m){h+='<tr><td>'+esc(m.mois)+'</td><td>'+nb(m.distance)+'</td><td>'+nb(m.heures)+'</td></tr>';});
@@ -2709,6 +2783,52 @@ const PAGE_FICHE = `<!DOCTYPE html>
       if(z2) z2.innerHTML='<div style="padding:14px;color:#8fb0c4;font-size:13px">Carte indisponible.</div>';
     }
   }
+  function couleurV(v,vmax){
+    var r=vmax>0?v/vmax:0;
+    return r<0.35?'#1e3a5f':r<0.55?'#0369a1':r<0.75?'#0891b2':r<0.9?'#16a34a':'#f59e0b';
+  }
+  function rendrePolaire(d){
+    var z=document.getElementById('polOut');
+    if(!z) return;
+    if(d.error){z.innerHTML='<div style="color:#8fb0c4">'+esc(d.error)+'</div>';return;}
+    if(d.vide||!d.grille||!d.grille.length){
+      z.innerHTML='<div style="color:#8fb0c4">Pas encore assez de navigations exploitables sur cette période.</div>';return;
+    }
+    var vmax=0; d.grille.forEach(function(c){if(c.mediane>vmax)vmax=c.mediane;});
+    var twsL=[],twaL=[];
+    d.grille.forEach(function(c){if(twsL.indexOf(c.tws)<0)twsL.push(c.tws);if(twaL.indexOf(c.twa)<0)twaL.push(c.twa);});
+    twsL.sort(function(a,b){return a-b;}); twaL.sort(function(a,b){return a-b;});
+    var m={}; d.grille.forEach(function(c){m[c.tws+':'+c.twa]=c;});
+    var h='<div style="color:#8fb0c4;font-size:12px;margin-bottom:6px">'
+      +d.retenus+' segment(s) retenu(s) · '+d.cases+' case(s) · '+d.avecCourant+' corrigé(s) du courant'
+      +(d.sansVent?(' · '+d.sansVent+' sans vent archivé'):'')+'</div>';
+    h+='<div style="overflow-x:auto"><table><tr><th>TWA \\ TWS</th>';
+    twsL.forEach(function(t){h+='<th>'+t+'</th>';});
+    h+='</tr>';
+    twaL.forEach(function(a){
+      h+='<tr><td>'+a+'°</td>';
+      twsL.forEach(function(t){
+        var c=m[t+':'+a];
+        if(!c){h+='<td style="color:#33556e">·</td>';return;}
+        var fiable=c.n>=8;
+        h+='<td title="'+c.n+' mesure(s), dispersion '+c.dispersion+' kt" style="background:'+couleurV(c.mediane,vmax)+';color:#fff;border-radius:4px;'+(fiable?'':'opacity:.45')+'">'
+          +c.mediane.toFixed(1).replace('.',',')+'</td>';
+      });
+      h+='</tr>';
+    });
+    h+='</table></div><div style="color:#8fb0c4;font-size:11px;margin-top:6px">Valeurs en nœuds (médiane). Les cases pâles reposent sur moins de 8 mesures.</div>';
+    z.innerHTML=h;
+  }
+  document.addEventListener('click',function(e){
+    if(e.target&&e.target.id==='polGo'){
+      var b=e.target; b.disabled=true; b.textContent='Calcul…';
+      fetch('/api/boats/'+bid+'/polaire?jours='+document.getElementById('jours').value)
+        .then(function(r){return r.json();})
+        .then(function(d){b.disabled=false;b.textContent='Recalculer';rendrePolaire(d);})
+        .catch(function(){b.disabled=false;b.textContent='Calculer la polaire';
+          var z=document.getElementById('polOut'); if(z) z.innerHTML='<div style="color:#8fb0c4">Calcul indisponible.</div>';});
+    }
+  });
   document.getElementById('jours').onchange=charger;
   charger();
 })();
@@ -3453,7 +3573,7 @@ boot();
 </html>
 `;
 const ICONS = { '/icon-180.png': Buffer.from('iVBORw0KGgoAAAANSUhEUgAAALQAAAC0CAIAAACyr5FlAAAGrklEQVR42u2dPW5VSRCFr4smISdxCiLzIAIStkHGQljELAIhRoMmYRsIiQAhUnsFLAFhJvCMsYzxu91dP6eqz5EDB+/ndvXXp6r7dt93dO/40UZRN0kYAopwUISDIhwU4aAIB0U4KMJBEQ6KcFCEg6IIB0U4KMJBGaqtOij6R8X5OeEgCrs/pDoujTSofUs5VhqZ0P/2KpQ0MkFKKsIhkuYKc1LSiIXfBWdDpBELIpIfDqmyXpcHkUYsiEhOOKT66j42IkIy2NJUziHr3Q6EtBAhGWx7BucQ7h/AspC2LBlHcmf/i3+cf/eOBgAfbREyulDY83ZzXAD4aIWxmARi/4dbgRKdYlo9MkyZuP0bTSiJs5BWiQx/LG68AH1EgvhoBcgIZ8LDSCL4aKnJ0MXi7MvHy/8fnDyFMxJ3PlpSMtDcwgkRXz6EZDjnGvxpf4RzaLQqIxb6FuLlH0IyUlqIi3+0FGTUwELZQuz9Q0hGYgsx9g+pH8HpaW291mHAMYH2kdyJjZ0bH1PNtDSPBksGwsC1Wg6/6YvGv8Ws+JClyLgYppd/J6//vv31p58//PouxBRj4x9wNYdF9G/s14NkXOXj4KeVLEEalG3oRsc61hY32Mbzi0FykZJkHBzZO23jd+ZhWjuPf5R2ckFJK1rBNTL8g3zofjVIfhEE21CJxf6+6bKNKDoHP0TVPCScDOehNkzGHvOAGPp6vRCfVub3hbv1RC8f6lve06aViITS+3bThILQQF3zkNSe4X/NXeaRt5mq6xy+1cZYvPxt49oFux6b01j2kHS2EU7GgHmENBkjrfTbRrowpeRj2s4zHWwfjmxgQoHl2wUOL9uwiqnIzz8X83CNwJx5SPlxY2cbM3ykiJ4428bKCSWmmyf6KMEUFDlJ50guVQvSmVj42IY/Hxng6PSrqicMEgyY0cwipaIQVG1UNQ8pSYb/5oGSfIhP9F3bL3Ly6q+IWAruyBm6NlDnmNlHGUPGtp1+eg+yszpTWkkxpw/nAzCqAtgHMztcomxjPj7mnd1/VbV+4QZAp5/eQ10PdFrpHRAzt5cgbGOCD49YregcMGRUUn44lB4opTsKayQXCekM9en7sG3YnWwY48M2U3ReDOS8g8KIcIWaA7ba+M88WHNE5ZQEdWja29f85SyaRz04stiG75p6KBz8jb6VZv5Zf0VrS7XqZZpc7OKc9ck+6dZD0zzeI33NwexGOMrYxoB5EI71Zrap+MgHB+whNqYVkrGQeTCtkI8ScDChEA6aB+FY3jbw+RCSQTGt0DwqwlHbNpD5QIHD9QGu8AKJhoC3cIVqY9I87EjqhMPlJ9RZfBiqpwehaw5OUlhzkAzQyhQIDtakF3zgxAHUOZhQ6sNBM7BOLqYR7ofDcsJy0VRP2/hx/n0hgjv7Di6thCQUKETOvnxkzUGh8yEOg3L/i/948w/JwCnp6Bw0D104bGpS2oYtH/295uEce9yPZAAuEzCtMLmow9HpUbdjTtvo5aPbNoYqAToHBQwHbQM2uRzdO340gZb5o9AUnlSx+yKvPmLl4ZNnPhO3gbrSJ6ckSCsKNbndzaAIMsqmlbFY6PBx8afFhManhUXDKa1sfg/Z1HwSkkiUVcz3sVtO2bat+aeJ+AdeXY3XQVCQ9lQ7p6GmEOjOgTjGhxVVEX3vl1DmWufqHF///Pb/v984QR3W/Zd38xSku/F0axXJUDFFqUo9PQNmKsuTcGjS6BEpjz9tAwCOHlTJhy0ZSkYu64wDekYoHJ3Akg+TKOnVf9rOQT6qkLFxsw/lCwfNo4RtmDkH+chPBlBaIR+A0TCDox9k8jEeB5sVakvn4Jq6j8ziLFDXTfNAKDVwp7Ir84HWdns4WHxkKzV8nYN8JCTDMa2Qj2xk+NYcnLxki6Qgt2oF84CankTPVshHEjI2hRNvg0xqQhl/Suo3Uj6D5J6XW0zY+o9C7ekDEEpMzqVFVGwtLISqfFztlUBErI4rBtXyLXKIGfARYiS2R1jjZnmhcFy2XMS6z9RB8TjTHD35j4bD0kJu78suXAKesgKwLIQBhwsf8f2digwkOIxTTBohrSPPwvH47buNQtXnF89n3s6jCRThoPoVtHzeB3BdgrHvVLc0ESyGSIYNDC1ZNAsgkmdfS0sZ2aSIZNvu1BJHOREiOXfB5YTjWsRhKUm+M7JtBYRGSZXdsm2rpFhKyu2gbltJXesnEdJAOHb34gAu6x2taNua4iGaHeK9FYpwUISDIhwU4aAIB0U4KMJBEQ6KcFCEg6IIB0U4KAX9C2pef+UnN8OcAAAAAElFTkSuQmCC', 'base64'), '/icon-192.png': Buffer.from('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', 'base64'), '/icon-512.png': Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAgAAAAIACAIAAAB7GkOtAAASAUlEQVR42u3dPY4c59UF4O6accLcCVMbzGjDgRNvQ5kX4kV4EYZgQ4YTb0MQwEAgmIor0BIENh0MLA9haH5qqrruved5oOzTJ/dUv+859/YMOedXr9+cAMizeAQACgAABQCAAgBAAQCgAABQAAAoAAAUAAAKAAAFAIACAEABAKAAAFAAACgAABQAAAoAAAUAgAIAQAEAoAAAUAAAKAAABQCAAgBAAQCgAABQAAAoAAAUAAAKAAAFAIACAEABAKAAAFAAACgAABQAAAoAAAUAgAIAYJVbj4CJg80+k83l4tGiAGBivr/8f1dDoACgfdZv+Gq1AgoApsX96i9KJaAAYGbiP/er1gcoACS+Z6IPUAAIfY9LGaAAEPoeozJAASD3PVtNgAJA7nvamgAFgND3FigDFABy3/uiCVAAiP7st0kNoACQ+xYCDwMFgNzXBKAAEP2xb6saQAEg9y0EHgYKANFvIUABIPpRAygA5D6J50ETKABEPxYCFACiHzWAAkD0owZQAIh+1AAKANGPGkABIPpRA/R6Sz0C6Q/OmA0A1xKsAgoA0Q9qQAEg+kENzHz3PALpD06jDQCXDawCCgDRD2pg/NvlEUh/cFZtALhOYBWwASD9wem1AeDygFXABoD0B+fZBoCrAlYBGwDSH5xwBYC7Ac55Gz4CciXgoAPv4yAbANIfJx8bgDvAZs7Lzbb/wc+XT57qLuffHqAARD8VUn7d/5Zu2OAiqAEFIP2pkPWbvDatYBVQAEj/gYm/4vXrAx2gABxx0T859J/4pSmDRy6IGlAA0l/oKwOrAApA+gt9ZaADUADSX+4HPB9NoAMUgPQX+h5adhnoAAUg+uW+MshtAt8WVgDSX/Rz92Bza0AHKADpL/fVQOhCoAMUgPQX/eQuBDpAAUh/uU/uQqADFID0F/3kLgQ6QAFIf9FPbg3oAAUg/eX+Ch8/vHv03/nN2z/OeL8mN4EOUADSX/STuxDoAAUg/UU/uTWgAxSA9Bf95NaADnjJw/MIpL/0T6sBNxEbgDMn+q0C9gAFQHb6i341oAMUAHHpL/rVwKga0AHPfWAegfRHDbihNgBSzpboZ/IqYA9QANJf9JNbAzrgic/JI5D+MPCc+CzIBuAkiX5yVwF7gA1A+kt/ck+OPcAGEHt6RD9WAXuADcD4Bs4SCiBj/HdjcaLGrPL78RHQtBMj+tn1aHX9OMgHQTYA6Q+5Z8weoACkP+gAFMCc83FebqT/Hp7yC4RjO6DrkdMBCsA4hg5w9lAAvUcDNxAn0BKgAKQ/lgDnUAcogIDT4EN/HeBA6gAFYOACJxMFkDEIuGMrJtP7/zzr/8sSMPx8xi8B8QUg/YcG/R4fSnz88G6//7gOkADXl/1XQUh/EbPpy5jz29Vf/GQ6PYrgvyXCR0Air9+Mf+DL+OH9d/VfpBOLDWDO+B97l1p/4fdffOZm0GkPSF0CUjcA6T900n/79TfHLgE2g66nN/KbAZEFIP0L5/5L/iNXSP/VHbDtV6oDdMAm/D4AN8fXePDXPv4DombfE7YBGP8l43VG/g3/g1cb/1++BOz9KJxnS4ACkP51c3/GF7hhB5wCPhrSAQqA3PTfNd2uPP73fVDONqkF0KHY592QKwy2B6b/tktAwkLQ4yuKWQJiCkD6m2S7dcDUx6gDFACT0/+amTXpw5+cGvBZkAJQ5gPvQ+bfgrD3EjDy8Tb4QgKWgIACkP5zs6nO+H+1DphUAzpAAaRzkwekv5Nj91UACjzx9PubLw9ZAiY9/OpfwuglwAbg3LdMn5rj//U7YEYNmCEUgOp2Y3unvwyVJArAezb8uvrMp+ASMOCt8UGQAjCsif4J4/+BHdC6BgwWCmB+XbuceL9avuyJS4ANwPnu9LK7fPp/7BLgsPFEE38hjO/9Dr2Nvve77u3zy1i2zJZZvzpYVhptzGJjlwAHj7ACqDr+u4SB478OGPiCZ33AMKsApP9Gr9YINnIBbXcO5YwCwK1r/Ol/nSWg6SqAAjD+S//GdIAlQAEYqL1UvNeOpQKIKeQuZ7fyp8MzfvSz2hJwavUtgaKvc8QSYAMwDJqwQjvAu8+IAjD+D32R/uSXM2AJUAAulfS3BDiulhUFMLGEXaccOmBcgvbOH+mZeJfqv0If/jgVWkoB9Ktft4imS4DTG7gE2ABMecZ/HWA+sAEY/6dfHumPY2wJsAG41VgCnBYUQMad6XKfjf/OjH5SAP12LrdF+g9bApzq1olkA8CsdO9y/vzPs/59HeD8jHbb9T67JLNu75bjvz8buPUpqvlbhcu9sIa/MdhVgSPVXwKYvBsb/43/o8Z/HeCQSycbgLVd+pN5olAA0bfCXbUEOO1MLIBKG5b7YPzXAV5V5YyyAQAwoACM/8Z/S4AzZgmwASD9dYCThgJwAdxJnDdXYHYB+OOdgxj/uy8BzMgrqWr2QQe4CDYAFJLxH4GrAOxTbqD0twTogPGpJVgdd3SAG2oDUKTO+s7vo/HfObQEKAAH3U3AEuCeKgASTvmynE6nt3/7h3fNaUQBtJwcSx3xNvftv79YUfqPXwJckI67rw2A0KOvA8AVtW7vnv7G/5A29UGQApC5mP13WAK+/9ZTdWfDCsCJ73isv3zXjP9RHSB2e+WYhO10pqU/OkAbKQBkU+oS4DkTUQBOea9x5v/eL+N/bAcYvbukmZB1lKW/THF/bQA4x5Ko0RJQ+8lLXgXQPlMc4nXvlPFfB6iiFnOS0+MEm/0HdrBziwLggNwx/l97CdDEKICp80uvMUr6H9YBLpFdZEgBGGfajv94R2j0Hjk0bHaOjf8HLwE6AAUwScXVVcqYMbufYRSAU7st43+JJQA3uncBGDAbjv/Sv1AHWAKsaDYAdLN3ChSAgWVfxv9ySwDutQJwWA2VuR1Q7P0SvgqAvsdkMf5PetegZAE4sq3GJelfeglwqhWzDcAx1cpRb64/GuZ2P92tR8Dg8X/dhRcTpEx3HoEhZd74f15u7v7JPEJllwDNqgBodDpafu9Xypx8EES/AihwTGXHU/jeLzbsGYu10cDprH5GmbQEmLFsABj/uXoHgAJA+gMKwHL6wLlwMMYtAd5TN10BOJfG/9wOcM4pWgDGE+M/3lnvhQ0A4z+zlwBsALQZTKS/wRMFMNnhn0v6YJScJcB1UwD0YPzXASgAfD6AdxkFgPEfSwAKwEiyiZqfSEp/HZB25tNyzwaAGvZeYwMA478lAAWQxjZKXAe8/86tdwwUAMZ/UABEH4RF+lsCUABYRdEBTr4CII/xHxQAYAlAAWD8RwegABh6ChbpDwrgsPQBLAGZs5cN4Eh+FMH4T2YHuPsKAOkPCgAzCJYA518BEDT+f/2NhwAKALAE+G6wAsD4jw5AASD9AQUAWAJQABj/0QEoAAAUAMZ/LAEoAKQ/OgAFAIACwPiPJQAFAOgAFADGf0ABIP2xBKAAAB2AAsD4DygAwBKAAsD4DygApD+WABQAoANQAMZ/4z+gAKQ/WAJQALV8vnzyEIjtAOdfAWD8BxSAGRzClgB3P7sALhcXyfiPDkh0dPrZAKQ/YAMAsAQoAIz/oAMUAAAKgH1s9aMIxn96LQF+CEcBsA3pT8cOQAEAoAAO0n0VNf5jCUi79QoA0AEogGDGf6BzAcT/bRCrt1HpT9MlwCcwFXLPBgBgA6Ab4z+tlwAUAKADUACHOvwTyee+AOM/rlvfF6AAWE/6YwlAAQA6gO4F4PeCGf8hR43EswEU4nNJEpYA59wGIH+N/+R2gJuuAJD+gAIALAEogHAPLKfGfwZ0gI9fFMAvKPBt8bKnU/rDnDte5ocebQC44VzPxw/vPAQbAM/IL+P/imd4949HoQN4wK1HQE6bnpcbOwTYANpcfuP/4DfXEuAAKIB7/IUQXx5T6Q/TVEo5GwAQtASgAHosAcZ/dAAK4IDw9RDAvVYAHON3f/+Xh4AlgLAC8H1g6Y8OmKpYvtkAbIvgRtsAMP6DJUABAOgABXCE4G8DGP9hrHrJZgP4Rdf/0FD6YwmYcZdtAABVOgAFUJrxH1AAp9OpyodlNkfovgRUucUlv7VpAzD+w/AOQAHUHR+kP1jiFUCDjQmwBIxJMxvAwYz/ENEBCsAWKf1hwM1VANF7E2AJGJBjNoDDRgnjPxj/FQDA6CVAAWD8Bx2gAJ6jzMdnG26U0h+63NYxCWYDACwBKIDjxgrjP+zaAb79O6sA/DAo0FH57LIBXHUJMP7DrkuA8f9Zzq9ev2myq1TpqvNyU+stLPZ6ir+hP3z/7aP/zm//8CfT4nVGosmvp8MbagNIX0pcD08j7uyhACYd+sYdoAbaPgQXQQEYkVADvnC65pUNwOzjwvh6XQEbAGrJROzLFLUKwNDU9A5MuJl3+TivCaZ8XU7+pPXuVgdSuu+XZcgXAjYAS4AlYM3g7MU7XcZ/BeDkJXbAqdvnJ0M/xXLa5+nzJ4H/11m1SqvsH8Tt+ieEex6DdqPfmJwt98JaHYOG3wO4XEpd/s+XTzWjtuwL2/6aHXgeMj7fl/5Tz4NvAjOrDPbuA9/RZZDbrhfeEmAJeHpGrz4t4t74P/q02ADm397EDpDj09OfTSyu9Ph74g7jVBsyZhWAE6kDcJ5RALgzOC2EFUC9nav4tXGrcYxDssgGgA7ACeEhzX8K6IifB/3xrz89+H//yamCQ/z6L78y/tsAJh4ywMVUABXq11ED6d99/LcB6ABwGW0AlgCAsOSxAZg7wDW0Aahihw+kf8z4bwPQAeDq2QAsAQ4iSP+k8d8GoAPAdbMBWAIAwnJm8d6YSsD4nzll+ghIB4ArFmpiARxa0Q4ojL1c4z5ktgHoAHCtbACWAIcVpH/M+G8DALABWAIsAWD8Txr/p28AOgCkv/QPLQDHF1wfcgugQHU7xND44oz++wVsADoAXBkbgCUAICk9Fu+iiQaM/5mzo4+AdAC4JqFiCqBGmTvc0OOCZHx0nLQB6ACQ/tI/tAAcdHApyC0APxEESIncDcAHQWD8l/6hBeDQg4tAbgGUKXlHH+kvGRSADgDpLxMUgA4A6S/9FQAACsASAMZ/478C0AEg/aW/AtABIP2lvwJwPcDxRgE0HwRcEqS/8V8BOA2A+64Aws6EJQDjv/RXAC4MOMwogLzRwLVB+hv/FYAOAOkv/RWADgDpL/0VgLMCuNEKYPiJsQRg/Jf+CsB1AscVBZA3OLhUSH/jvwLQASD9pb8C0AHgcEp/BeAkAe6sAhh+niwBGP+lvwLQAeBASn8FoAPAUZT+CkAHgPRHAegAkP4oAKcN3EcUwLAzZwkg/eBJfwWgA0D6owB0AEh/Hnd+9fqNp7BFk06u0vNy4x3u6PPlk9mLB9x6BJudxbkd8HOOaAK5L/0VAHEdcD9Z1IDol/4KgMQOUAOiX/orAKI74ORzIbkv/RUAyR1gIRD90l8BkN4BFgK5L/0VANEdYCEQ/dJfAfDlqQ2uAU0g90W/ArAK5P6J6/v5pQyEvvRXADogPdc0gdyX/gpAB0i69DIQ+tJfAegACRhUBkJf+iuA4JOtBvLKQOiLfgWAVWBlYrbrA4kv/RUAOmDHPC3SCrJe+isAVp14NbBP8m7eDVJe9CsArALtuwHpzx3R4w6Ak28D4PCbYBVA9GMDcCvAOUcBuBvghLMLHwFVvSE+DkL0YwNwW8B5xgZgFQDRjw3A/QGnl8wN4Pf//Lc3Dyji/Z+/sgEAoAAAUAAAKAAAFAAACgAABQCAAgBAAQCwufOr1288hbn9ruDZgr/RYSh/GVzAvVUDiH4UgBoA0Y8CUAMg+hUAagBEvwIg7p5rAuS+AsBCgOhHAaAGEP0oADITQRPIfRQAFgJEPwoACwFyHwWAJkDuowBIzBQ1IPpRAFgIPAy5jwIgPnGUgdBHAWAt8DDkPgoATYDcRwEQnlbKQOijAJBiykDoowCQbvpA4qMAkH1pfSDxUQDweDIOqARxjwKAzdKzbCvIehQAHJyzOzWEfEcBQPuGAE4nP4MBoAAAUAAAKAAAFAAACgAABQCAAgBAAQCgAABQAAAoAAAUAAAKAAAFAIACAEABAKAAAFAAACgAABQAAAoAAAUAgAIAUAAAKAAAFAAACgAABQCAAgBAAQCgAABQAAAoAAAUAAAKAAAFAIACAEABAKAAAFAAALzYfwAGQwh6/XGzZAAAAABJRU5ErkJggg==', 'base64') };
-const BUILD = '30/07 — fiche bateau v2';
+const BUILD = '30/07 — polaire observee v2';
 const LEAFLET_JS = `/* @preserve
  * Leaflet 1.9.4, a JS library for interactive maps. https://leafletjs.com
  * (c) 2010-2023 Vladimir Agafonkin, (c) 2010-2011 CloudMade
@@ -4748,6 +4868,121 @@ const server = http.createServer(async (req, res) => {
     /* Fiche d'un bateau : statistiques agregees sur tout son historique
        (archive + chaud). Tout est calcule ici, jamais dans la page : la fiche
        doit rester lisible sur un telephone sans transferer 100 000 points. */
+    /* ---- Polaire OBSERVEE d'un bateau ----
+       Reconstruite depuis son historique reel : pour chaque segment, vitesse
+       fond mesuree, corrigee du courant de maree Shom pour obtenir la vitesse
+       surface, croisee avec le vent archive au point et a l'heure. Agregation
+       par tranches (TWS 2 kt, TWA 10 deg) avec MEDIANE — pas moyenne : les
+       manoeuvres, les arrets et les positions aberrantes ne doivent pas tirer
+       la grille. Chaque case porte son nombre de mesures : une case a 3
+       mesures ne vaut pas une case a 200, et la page doit le montrer. */
+    const mPolObs = p.match(/^\/api\/boats\/([a-f0-9]{16})\/polaire$/);
+    if (mPolObs && req.method === 'GET') {
+      const bid = mPolObs[1];
+      const meta = await store.getMeta(bid);
+      if (!meta) return json(res, 404, { error: 'bateau introuvable' });
+      const jours = Math.min(400, Math.max(1, parseInt(u.searchParams.get('jours'), 10) || 90));
+      const t0p = Date.now() - jours * 86400e3;
+      const maxSegments = Math.min(4000, Math.max(100, parseInt(u.searchParams.get('max'), 10) || 1500));
+
+      /* historique complet */
+      const tous = [];
+      if (ARCHIVE_ACTIVE) {
+        const d0 = new Date(t0p), d1 = new Date();
+        let an = d0.getUTCFullYear(), mo = d0.getUTCMonth() + 1;
+        while (an < d1.getUTCFullYear() || (an === d1.getUTCFullYear() && mo <= d1.getUTCMonth() + 1)) {
+          try { const pk = await archiveLire(bid, an, mo); if (pk && pk.points) tous.push(...pk.points); } catch {}
+          mo++; if (mo > 12) { mo = 1; an++; }
+        }
+      }
+      tous.push(...(await store.points(bid)));
+      const parT = new Map();
+      for (const q of tous) if (q[2] >= t0p) parT.set(q[2], q);
+      const pts = Array.from(parT.values()).sort((a, b) => a[2] - b[2]);
+      if (pts.length < 3) return json(res, 200, { bateau: bid, nom: meta.name, jours: jours, vide: true, n: pts.length }, req);
+
+      const R_NM = 3440.065, RAD = Math.PI / 180;
+      const dNm = (a, b) => {
+        const dp = (b[0] - a[0]) * RAD, dl = (b[1] - a[1]) * RAD;
+        const h = Math.sin(dp / 2) ** 2 + Math.cos(a[0] * RAD) * Math.cos(b[0] * RAD) * Math.sin(dl / 2) ** 2;
+        return 2 * R_NM * Math.asin(Math.sqrt(h));
+      };
+      const capVers = (a, b) => {
+        const p1 = a[0] * RAD, p2 = b[0] * RAD, dl = (b[1] - a[1]) * RAD;
+        const y = Math.sin(dl) * Math.cos(p2), x = Math.cos(p1) * Math.sin(p2) - Math.sin(p1) * Math.cos(p2) * Math.cos(dl);
+        return (Math.atan2(y, x) / RAD + 360) % 360;
+      };
+
+      /* segments exploitables : entre 4 et 90 min, distance credible */
+      const segments = [];
+      for (let i = 1; i < pts.length && segments.length < maxSegments; i++) {
+        const a = pts[i - 1], b = pts[i];
+        const dtMin = (b[2] - a[2]) / 60000;
+        if (dtMin < 4 || dtMin > 90) continue;
+        const d = dNm(a, b);
+        const vFond = d / (dtMin / 60);
+        if (!isFinite(vFond) || vFond < 0.8 || vFond > 35) continue;   /* a l'arret ou aberrant */
+        segments.push({ a: a, b: b, d: d, dtMin: dtMin, vFond: vFond, cog: capVers(a, b),
+                        lat: (a[0] + b[0]) / 2, lon: (a[1] + b[1]) / 2, t: (a[2] + b[2]) / 2 });
+      }
+
+      /* grille : TWS par 2 kt (0..40), TWA par 10 deg (0..180) */
+      const TWS_PAS = 2, TWA_PAS = 10;
+      const cases = new Map();
+      let nUtil = 0, nSansVent = 0, nCourant = 0;
+      for (const sg of segments) {
+        const vt = await ventArchive(sg.lat, sg.lon, sg.t);
+        if (!vt || vt.tws === null) { nSansVent++; continue; }
+        /* vitesse surface = vecteur fond moins courant de maree */
+        let vSurface = sg.vFond, cSurface = sg.cog;
+        if (C2D) {
+          const sonde = courantAu(sg.lat, sg.lon, 0, 70);
+          if (sonde) {
+            const coefS = await coefficientA(sg.t);
+            const refS = await phasePour(sonde.port, sonde.base, sg.t);
+            if (refS && coefS !== null && Math.abs(sg.t - refS.t) <= 8 * 3600e3) {
+              const hRel = Math.max(-6, Math.min(6, (sg.t - refS.t) / 3600e3));
+              const c2 = courantAu(sg.lat, sg.lon, hRel, coefS);
+              if (c2) {
+                const vx = sg.vFond * Math.sin(sg.cog * RAD) - c2.u;
+                const vy = sg.vFond * Math.cos(sg.cog * RAD) - c2.v;
+                vSurface = Math.sqrt(vx * vx + vy * vy);
+                cSurface = (Math.atan2(vx, vy) / RAD + 360) % 360;
+                nCourant++;
+              }
+            }
+          }
+        }
+        const twa = Math.abs(((cSurface - vt.twd + 540) % 360) - 180);
+        const iTws = Math.round(vt.tws / TWS_PAS) * TWS_PAS;
+        const iTwa = Math.round(twa / TWA_PAS) * TWA_PAS;
+        if (iTws > 40 || iTwa > 180) continue;
+        const cle = iTws + ':' + iTwa;
+        if (!cases.has(cle)) cases.set(cle, []);
+        cases.get(cle).push(Math.round(vSurface * 100) / 100);
+        nUtil++;
+      }
+
+      const grille = [];
+      for (const [cle, vals] of cases) {
+        vals.sort((x, y) => x - y);
+        const med = vals.length % 2 ? vals[(vals.length - 1) / 2] : (vals[vals.length / 2 - 1] + vals[vals.length / 2]) / 2;
+        const q1 = vals[Math.floor(vals.length * 0.25)], q3 = vals[Math.floor(vals.length * 0.75)];
+        const [tws, twa] = cle.split(':').map(Number);
+        grille.push({ tws: tws, twa: twa, n: vals.length,
+                      mediane: Math.round(med * 100) / 100,
+                      max: vals[vals.length - 1],
+                      dispersion: Math.round((q3 - q1) * 100) / 100 });
+      }
+      grille.sort((a, b) => a.tws - b.tws || a.twa - b.twa);
+      return json(res, 200, {
+        bateau: bid, nom: meta.name, mmsi: meta.mmsi || null, jours: jours,
+        segments: segments.length, retenus: nUtil, sansVent: nSansVent, avecCourant: nCourant,
+        pasTws: TWS_PAS, pasTwa: TWA_PAS,
+        appelsMeteo: ventArchiveAppels, erreursMeteo: ventArchiveErreurs,
+        cases: grille.length, grille: grille
+      }, req);
+    }
     const mFiche = p.match(/^\/api\/boats\/([a-f0-9]{16})\/fiche$/);
     if (mFiche && req.method === 'GET') {
       const bid = mFiche[1];
