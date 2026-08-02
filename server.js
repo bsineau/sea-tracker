@@ -168,9 +168,9 @@ function sendFile(res, body, type, filename){
 }
 
 // --- Vent animé : grille Open-Meteo -> format velocity (leaflet-velocity) ---
-function windToVelocity(la1, lo1, la2, lo2, nx, ny, step, uArr, vArr) {
+function windToVelocity(la1, lo1, la2, lo2, nx, ny, dx, dy, uArr, vArr) {
   const now = new Date().toISOString();
-  const base = { parameterCategory: 2, dx: step, dy: step, nx: nx, ny: ny, lo1: lo1, la1: la1, lo2: lo2, la2: la2, refTime: now, forecastTime: 0 };
+  const base = { parameterCategory: 2, dx: dx, dy: dy, nx: nx, ny: ny, lo1: lo1, la1: la1, lo2: lo2, la2: la2, refTime: now, forecastTime: 0 };
   return [
     { header: Object.assign({}, base, { parameterNumber: 2, parameterNumberName: 'U-component_of_wind', parameterUnit: 'm.s-1' }), data: uArr },
     { header: Object.assign({}, base, { parameterNumber: 3, parameterNumberName: 'V-component_of_wind', parameterUnit: 'm.s-1' }), data: vArr }
@@ -259,20 +259,33 @@ async function omGrilleVar(qlat, qlon, variable, modele, heure) {
   return arr.map((p) => { const h = (p && p.hourly) || {}; return num(h[variable] && h[variable][idx]); });
 }
 
-async function fetchWind(clat, clon, model, hour) {
-  const STEP = 1, HALF_LAT = 6, HALF_LON = 8;
-  const la1 = Math.round(clat) + HALF_LAT, la2 = Math.round(clat) - HALF_LAT;
-  const lo1 = Math.round(clon) - HALF_LON, lo2 = Math.round(clon) + HALF_LON;
-  const nx = Math.round((lo2 - lo1) / STEP) + 1, ny = Math.round((la1 - la2) / STEP) + 1;
+/* Fenetre du vent anime. Elle etait figee a +/-6 deg en latitude et +/-8 en
+   longitude autour du centre, au pas de 1 deg : des que la carte etait plus
+   large, l'animation ne couvrait qu'une bande de l'ecran, et elle ne suivait
+   pas le zoom. Elle epouse desormais la fenetre demandee, avec un pas adapte
+   et un plafond de points identique a l'ancien (le cout en quota ne bouge pas). */
+async function fetchWind(la0, la1, lo0, lo1, model, hour) {
+  const MAXP = 240;
+  const hLat = Math.max(0.5, la1 - la0), hLon = Math.max(0.5, lo1 - lo0);
+  const rapport = hLon / hLat;
+  let ny = Math.max(5, Math.min(20, Math.round(Math.sqrt(MAXP / Math.max(0.2, rapport)))));
+  let nx = Math.max(5, Math.min(26, Math.floor(MAXP / ny)));
+  while (nx * ny > MAXP) { if (nx >= ny) nx--; else ny--; }
+  const dx = hLon / (nx - 1), dy = hLat / (ny - 1);
   const qlat = [], qlon = [];
-  for (let la = la1; la >= la2; la -= STEP) for (let lo = lo1; lo <= lo2; lo += STEP) { qlat.push(la); qlon.push(lo); }
+  for (let j = 0; j < ny; j++) for (let i = 0; i < nx; i++) { qlat.push(la1 - j * dy); qlon.push(lo0 + i * dx); }
   hour = hour || 0;
-  let e = await omGrid(qlat, qlon, model, hour);
-  if (!e || !e.length) e = await omGrid(qlat, qlon, model, 0);
+  const cle = cacheCle('anim', la0, la1, lo0, lo1, nx, ny, model, hour);
+  let e = cacheLire(cle, 600000);
+  if (!e) {
+    e = await omGrid(qlat, qlon, model, hour);
+    if (!e || !e.length) e = await omGrid(qlat, qlon, model, 0);
+    if (e && e.length) cacheEcrire(cle, e);
+  }
   e = e || [];
   const N = nx * ny, uArr = [], vArr = [];
   for (let i = 0; i < N; i++) { const p = e[i] || { sp: 0, dr: 0 }; const rad = p.dr * Math.PI / 180; uArr.push(-p.sp * Math.sin(rad)); vArr.push(-p.sp * Math.cos(rad)); }
-  return windToVelocity(la1, lo1, la2, lo2, nx, ny, STEP, uArr, vArr);
+  return windToVelocity(la1, lo0, la0, lo1, nx, ny, dx, dy, uArr, vArr);
 }
 async function omForecast(clat, clon, model, vars) {
   let url = 'https://api.open-meteo.com/v1/forecast?latitude=' + clat + '&longitude=' + clon
@@ -285,20 +298,51 @@ async function fetchForecast(clat, clon, model) {
   if (d && d.error) d = await omForecast(clat, clon, model, 'wind_speed_10m,wind_direction_10m,pressure_msl,cloud_cover');
   return d;
 }
+/* Point d'info complet. Une seule localisation par appel : ajouter des
+   variables coute infiniment moins cher qu'ajouter des points de grille, d'ou
+   le choix d'enrichir ce point plutot que de multiplier les calques. Les
+   variables mer viennent de l'API Marine, sur un appel distinct et parallele ;
+   si l'une des deux echoue, l'autre reste affichee. */
 async function fetchPoint(lat, lon) {
-  const wUrl = 'https://api.open-meteo.com/v1/forecast?latitude=' + lat + '&longitude=' + lon + '&current=wind_speed_10m,wind_direction_10m,pressure_msl&wind_speed_unit=kn&timezone=auto';
-  const mUrl = 'https://marine-api.open-meteo.com/v1/marine?latitude=' + lat + '&longitude=' + lon + '&current=ocean_current_velocity,ocean_current_direction&timezone=auto';
+  const varsAir = ['wind_speed_10m','wind_direction_10m','wind_gusts_10m','pressure_msl',
+                   'temperature_2m','apparent_temperature','relative_humidity_2m','dew_point_2m',
+                   'cloud_cover','precipitation','visibility'].join(',');
+  const varsMer = ['ocean_current_velocity','ocean_current_direction','wave_height','wave_direction',
+                   'wave_period','swell_wave_height','swell_wave_direction','swell_wave_period',
+                   'wind_wave_height','sea_surface_temperature'].join(',');
+  const wUrl = 'https://api.open-meteo.com/v1/forecast?latitude=' + lat + '&longitude=' + lon
+    + '&current=' + varsAir + '&wind_speed_unit=kn&timezone=auto';
+  const mUrl = 'https://marine-api.open-meteo.com/v1/marine?latitude=' + lat + '&longitude=' + lon
+    + '&current=' + varsMer + '&timezone=auto';
   const [w, m] = await Promise.all([
     fetch(wUrl).then(r => r.json()).catch(() => ({})),
     fetch(mUrl).then(r => r.json()).catch(() => ({}))
   ]);
-  const wc = (w && w.current) || {}, mc = (m && m.current) || {};
+  /* repli : si la liste longue est refusee, on retente le strict necessaire,
+     pour ne jamais perdre le vent et la pression au profit du confort */
+  let wc = (w && w.current) || {};
+  if (!w || w.error || wc.wind_speed_10m === undefined) {
+    const w2 = await fetch('https://api.open-meteo.com/v1/forecast?latitude=' + lat + '&longitude=' + lon
+      + '&current=wind_speed_10m,wind_direction_10m,pressure_msl&wind_speed_unit=kn&timezone=auto')
+      .then(r => r.json()).catch(() => ({}));
+    wc = (w2 && w2.current) || {};
+  }
+  const mc = (m && m.current) || {};
   const cv = num(mc.ocean_current_velocity);
   const cu = m && m.current_units ? m.current_units.ocean_current_velocity : 'km/h';
   const curKt = cv === null ? null : (cu === 'm/s' ? cv * 1.94384 : (cu === 'kn' || cu === 'kt' ? cv : cv / 1.852));
+  const vis = num(wc.visibility);
   return {
-    wind: num(wc.wind_speed_10m), windDir: num(wc.wind_direction_10m), pressure: num(wc.pressure_msl),
-    curSpeed: curKt === null ? null : Math.round(curKt * 10) / 10, curDir: num(mc.ocean_current_direction)
+    wind: num(wc.wind_speed_10m), windDir: num(wc.wind_direction_10m),
+    gust: num(wc.wind_gusts_10m), pressure: num(wc.pressure_msl),
+    temp: num(wc.temperature_2m), tempRes: num(wc.apparent_temperature),
+    hum: num(wc.relative_humidity_2m), rosee: num(wc.dew_point_2m),
+    nuages: num(wc.cloud_cover), pluie: num(wc.precipitation),
+    visib: vis === null ? null : Math.round(vis / 185.2) / 10,   /* metres -> milles */
+    curSpeed: curKt === null ? null : Math.round(curKt * 10) / 10, curDir: num(mc.ocean_current_direction),
+    houleH: num(mc.wave_height), houleDir: num(mc.wave_direction), houleT: num(mc.wave_period),
+    houleFdH: num(mc.swell_wave_height), houleFdDir: num(mc.swell_wave_direction), houleFdT: num(mc.swell_wave_period),
+    merVentH: num(mc.wind_wave_height), tempMer: num(mc.sea_surface_temperature)
   };
 }
 
@@ -1346,9 +1390,23 @@ map.on('click', function(e){
   }).catch(function(){});
   fetch('/api/point?lat='+ll.lat.toFixed(3)+'&lon='+ll.lng.toFixed(3)).then(function(r){return r.json();}).then(function(d){
     meteoHtml='<b>'+fmtCoord(ll.lat,ll.lng)+'</b><br>'
-      +'💨 Vent : '+(d.wind!=null?Math.round(d.wind)+' kt '+dtxt(d.windDir):'—')+'<br>'
+      +'💨 Vent : '+(d.wind!=null?Math.round(d.wind)+' kt '+dtxt(d.windDir):'—')
+        +(d.gust!=null?' <span style="opacity:.85">raf. '+Math.round(d.gust)+'</span>':'')+'<br>'
       +'🔽 Pression : '+(d.pressure!=null?Math.round(d.pressure)+' hPa':'—')+'<br>'
-      +'🌊 Courant : '+(d.curSpeed!=null?d.curSpeed.toFixed(1)+' kt '+dtxt(d.curDir):'—');
+      +'🌊 Courant : '+(d.curSpeed!=null?d.curSpeed.toFixed(1)+' kt '+dtxt(d.curDir):'—')
+      +(d.houleH!=null?('<br>〜 Houle : '+d.houleH.toFixed(1).replace('.',',')+' m '
+        +(d.houleDir!=null?dtxt(d.houleDir):'')+(d.houleT!=null?' · '+Math.round(d.houleT)+' s':'')):'')
+      +(d.houleFdH!=null?('<br><span style="opacity:.8">&nbsp;&nbsp;fond : '+d.houleFdH.toFixed(1).replace('.',',')+' m '
+        +(d.houleFdDir!=null?dtxt(d.houleFdDir):'')+(d.houleFdT!=null?' · '+Math.round(d.houleFdT)+' s':'')+'</span>'):'')
+      +(d.merVentH!=null?('<br><span style="opacity:.8">&nbsp;&nbsp;mer du vent : '+d.merVentH.toFixed(1).replace('.',',')+' m</span>'):'')
+      +(d.temp!=null?('<br>🌡 Air : '+Math.round(d.temp)+' °C'
+        +(d.tempRes!=null&&Math.abs(d.tempRes-d.temp)>=1?' (ressenti '+Math.round(d.tempRes)+')':'')
+        +(d.tempMer!=null?' · mer '+Math.round(d.tempMer)+' °C':'')):'')
+      +(d.rosee!=null?('<br><span style="opacity:.8">&nbsp;&nbsp;rosée '+Math.round(d.rosee)+' °C'
+        +(d.hum!=null?' · '+Math.round(d.hum)+' % HR':'')+'</span>'):'')
+      +(d.nuages!=null?('<br>☁️ Nuages : '+Math.round(d.nuages)+' %'
+        +(d.pluie!=null&&d.pluie>0?' · pluie '+d.pluie.toFixed(1).replace('.',',')+' mm':'')):'')
+      +(d.visib!=null?('<br>👁 Visibilité : '+(d.visib>=10?'> 10':d.visib.toFixed(1).replace('.',','))+' NM'):'');
     rendre();
   }).catch(function(){pop.setContent('Erreur de chargement');});
 });
@@ -1944,21 +2002,46 @@ function windOpts(d){return {displayValues:true,
   data:d, minVelocity:0, maxVelocity:18, velocityScale:0.014, opacity:1,
   lineWidth:2.4, particleAge:110, particleMultiplier:1/170, paneName:'windPane',
   colorScale:['#3a4cff','#0091ff','#00c2ff','#00e0a0','#61ff3d','#d4ff00','#ffd000','#ff8a00','#ff3b2f','#ff0a78']};}
-function loadWind(){
-  if(!L.velocityLayer)return; windBusy=true;
-  var c=map.getCenter();
+/* Fenetre chargee pour l'animation, marge comprise : meme logique que les
+   barbules et les isobares, pour que les trois calques regardent la meme zone. */
+var windCouv=null;
+function windDansCouverture(a0,a1,o0,o1,mod,hr){
+  if(!windCouv) return false;
+  if(windCouv.modele!==mod || windCouv.heure!==hr) return false;
+  if(a0<windCouv.la0 || a1>windCouv.la1 || o0<windCouv.lo0 || o1>windCouv.lo1) return false;
+  return (a1-a0)/(windCouv.la1-windCouv.la0) > 0.7 && (o1-o0)/(windCouv.lo1-windCouv.lo0) > 0.7;
+}
+function loadWind(force){
+  if(!L.velocityLayer)return;
   var model=document.getElementById('windModel').value, hour=document.getElementById('windHour').value;
-  fetch('/api/wind?lat='+c.lat.toFixed(2)+'&lon='+c.lng.toFixed(2)+'&model='+encodeURIComponent(model)+'&hour='+hour)
+  var b=map.getBounds();
+  var a0=b.getSouth(), a1=b.getNorth(), o0=b.getWest(), o1=b.getEast();
+  if(!force && windDansCouverture(a0,a1,o0,o1,model,hour)) return;
+  if(windBusy) return;
+  var mLa=(a1-a0)*0.18, mLo=(o1-o0)*0.18;
+  a0-=mLa; a1+=mLa; o0-=mLo; o1+=mLo;
+  if(a0<-85)a0=-85; if(a1>85)a1=85;
+  if(o1-o0>240){ var cc=(o0+o1)/2; o0=cc-120; o1=cc+120; }
+  if(o1-o0>=359.9){ o0=-180; o1=180; }
+  else { var ce=(o0+o1)/2, demi=(o1-o0)/2;
+    ce=((ce+180)%360+360)%360-180; o0=ce-demi; o1=ce+demi;
+    if(o0<-180){ o1+=(-180-o0); o0=-180; if(o1>180)o1=180; }
+    if(o1>180){ o0-=(o1-180); o1=180; if(o0<-180)o0=-180; } }
+  windBusy=true;
+  fetch('/api/wind?lat0='+a0.toFixed(2)+'&lat1='+a1.toFixed(2)+'&lon0='+o0.toFixed(2)+'&lon1='+o1.toFixed(2)
+        +'&model='+encodeURIComponent(model)+'&hour='+hour)
    .then(function(r){return r.json();}).then(function(d){
      windBusy=false;
+     windCouv={la0:a0,la1:a1,lo0:o0,lo1:o1,modele:model,heure:hour};
      if(windLayer){windGroup.removeLayer(windLayer);windLayer=null;}
      windLayer=L.velocityLayer(windOpts(d)); windGroup.addLayer(windLayer);
    }).catch(function(){windBusy=false;});
 }
-map.on('overlayadd', function(e){ if(e.layer!==windGroup)return; document.getElementById('windCtl').style.display='block'; if(!windLayer&&!windBusy)loadWind(); });
+map.on('moveend', function(){ if(map.hasLayer(windGroup)) loadWind(false); });
+map.on('overlayadd', function(e){ if(e.layer!==windGroup)return; document.getElementById('windCtl').style.display='block'; if(!windLayer&&!windBusy)loadWind(true); });
 map.on('overlayremove', function(e){ if(e.layer!==windGroup)return; document.getElementById('windCtl').style.display='none'; if(windLayer){windGroup.removeLayer(windLayer);windLayer=null;} });
-document.getElementById('windModel').onchange=function(){ if(map.hasLayer(windGroup))loadWind(); };
-document.getElementById('windHour').onchange=function(){ if(map.hasLayer(windGroup))loadWind(); };
+document.getElementById('windModel').onchange=function(){ windCouv=null; if(map.hasLayer(windGroup))loadWind(true); };
+document.getElementById('windHour').onchange=function(){ windCouv=null; if(map.hasLayer(windGroup))loadWind(true); };
   return loadWind;
 }
 
@@ -3566,9 +3649,23 @@ map.on('click',function(e){
     }
   }).catch(function(){});
   fetch('/api/point?lat='+ll.lat.toFixed(3)+'&lon='+ll.lng.toFixed(3)).then(function(r){return r.json();}).then(function(d){
-    meteoHtml='💨 Vent : '+(d.wind!=null?Math.round(d.wind)+' kt '+dt(d.windDir):'—')+'<br>'
+    meteoHtml='💨 Vent : '+(d.wind!=null?Math.round(d.wind)+' kt '+dt(d.windDir):'—')
+        +(d.gust!=null?' <span style="opacity:.85">raf. '+Math.round(d.gust)+'</span>':'')+'<br>'
       +'🔽 Pression : '+(d.pressure!=null?Math.round(d.pressure)+' hPa':'—')+'<br>'
-      +'🌊 Courant : '+(d.curSpeed!=null?d.curSpeed.toFixed(1)+' kt '+dt(d.curDir):'—');
+      +'🌊 Courant : '+(d.curSpeed!=null?d.curSpeed.toFixed(1)+' kt '+dt(d.curDir):'—')
+      +(d.houleH!=null?('<br>〜 Houle : '+d.houleH.toFixed(1).replace('.',',')+' m '
+        +(d.houleDir!=null?dt(d.houleDir):'')+(d.houleT!=null?' · '+Math.round(d.houleT)+' s':'')):'')
+      +(d.houleFdH!=null?('<br><span style="opacity:.8">&nbsp;&nbsp;fond : '+d.houleFdH.toFixed(1).replace('.',',')+' m '
+        +(d.houleFdDir!=null?dt(d.houleFdDir):'')+(d.houleFdT!=null?' · '+Math.round(d.houleFdT)+' s':'')+'</span>'):'')
+      +(d.merVentH!=null?('<br><span style="opacity:.8">&nbsp;&nbsp;mer du vent : '+d.merVentH.toFixed(1).replace('.',',')+' m</span>'):'')
+      +(d.temp!=null?('<br>🌡 Air : '+Math.round(d.temp)+' °C'
+        +(d.tempRes!=null&&Math.abs(d.tempRes-d.temp)>=1?' (ressenti '+Math.round(d.tempRes)+')':'')
+        +(d.tempMer!=null?' · mer '+Math.round(d.tempMer)+' °C':'')):'')
+      +(d.rosee!=null?('<br><span style="opacity:.8">&nbsp;&nbsp;rosée '+Math.round(d.rosee)+' °C'
+        +(d.hum!=null?' · '+Math.round(d.hum)+' % HR':'')+'</span>'):'')
+      +(d.nuages!=null?('<br>☁️ Nuages : '+Math.round(d.nuages)+' %'
+        +(d.pluie!=null&&d.pluie>0?' · pluie '+d.pluie.toFixed(1).replace('.',',')+' mm':'')):'')
+      +(d.visib!=null?('<br>👁 Visibilité : '+(d.visib>=10?'> 10':d.visib.toFixed(1).replace('.',','))+' NM'):'');
     rendre();
   }).catch(function(){pop.setContent('Erreur');});
 });
@@ -4598,7 +4695,7 @@ boot();
 </html>
 `;
 const ICONS = { '/icon-180.png': Buffer.from('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', 'base64'), '/icon-192.png': Buffer.from('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', 'base64'), '/icon-512.png': Buffer.from('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', 'base64') };
-const BUILD = '01/08r — modele et echeance communs aux calques';
+const BUILD = '01/08t — point d info complet (mer, rafales, visibilite)';
 const LEAFLET_JS = `/* @preserve
  * Leaflet 1.9.4, a JS library for interactive maps. https://leafletjs.com
  * (c) 2010-2023 Vladimir Agafonkin, (c) 2010-2011 CloudMade
@@ -5858,11 +5955,21 @@ const server = http.createServer(async (req, res) => {
       res.writeHead(200, CORS); return res.end('OK');
     }
     if (p === '/api/wind' && req.method === 'GET') {
-      const clat = num(parseFloat(u.searchParams.get('lat')));
-      const clon = num(parseFloat(u.searchParams.get('lon')));
       const model = u.searchParams.get('model') || '';
       const hour = parseInt(u.searchParams.get('hour'), 10) || 0;
-      const vel = await fetchWind(clat === null ? 47 : clat, clon === null ? -4 : clon, model, hour);
+      let wa0 = num(parseFloat(u.searchParams.get('lat0'))), wa1 = num(parseFloat(u.searchParams.get('lat1')));
+      let wo0 = num(parseFloat(u.searchParams.get('lon0'))), wo1 = num(parseFloat(u.searchParams.get('lon1')));
+      if (wa0 === null || wa1 === null || wo0 === null || wo1 === null) {
+        /* compatibilite : centre seul, on reconstitue l'ancienne fenetre */
+        const clat = num(parseFloat(u.searchParams.get('lat'))), clon = num(parseFloat(u.searchParams.get('lon')));
+        const cla = clat === null ? 47 : clat, clo = clon === null ? -4 : clon;
+        wa0 = cla - 6; wa1 = cla + 6; wo0 = clo - 8; wo1 = clo + 8;
+      }
+      if (wa0 < -85) wa0 = -85;
+      if (wa1 > 85) wa1 = 85;
+      if (wo1 - wo0 > 240) { const cc = (wo0 + wo1) / 2; wo0 = cc - 120; wo1 = cc + 120; }
+      if (wa1 - wa0 <= 0 || wo1 - wo0 <= 0) return json(res, 400, { error: 'fenetre invalide' });
+      const vel = await fetchWind(wa0, wa1, wo0, wo1, model, hour);
       return json(res, 200, vel);
     }
     if (p === '/api/forecast' && req.method === 'GET') {
