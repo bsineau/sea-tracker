@@ -4695,14 +4695,11 @@ var triCache=[];
   };
   /* Essai d'abonnement AIS — bloc isole : son absence ne doit rien casser */
   if($('aeBtn')) $('aeBtn').onclick=function(){
-    var b=this; b.disabled=true; b.textContent='Essai en cours…'; $('aeOut').innerHTML='';
-    say($('aeMsg'),'Plusieurs variantes testées l’une après l’autre — compte environ une minute.','');
-    api('/api/admin/aisessai').then(function(r){
-      b.disabled=false; b.textContent='Relancer l’essai (≈1 min)';
-      if(r.code!==200){ say($('aeMsg'),(r.body&&r.body.error)||('Erreur '+r.code),'err'); return; }
-      var d=r.body||{};
-      if(d.ok===false&&d.raison){ say($('aeMsg'),d.raison,'err'); return; }
-      say($('aeMsg'),'','');
+    var b=this, sondes=0;
+    b.disabled=true; b.textContent='Essai en cours…'; $('aeOut').innerHTML='';
+    say($('aeMsg'),'Lancement…','');
+    function repos(){ b.disabled=false; b.textContent='Relancer l’essai (≈1 min)'; }
+    function rendre(d){
       var h='<div style="color:#8fb0c4;margin-bottom:6px">Mode '+esc(d.mode||'')+' · '+esc(d.zone||'')+'</div>';
       (d.essais||[]).forEach(function(e){
         var tient=!!e.survit, recoit=tient&&(e.messages>0);
@@ -4725,7 +4722,26 @@ var triCache=[];
           +(conf?'▲ ':(inf?'■ ':'● '))+'Mécanisme — '+esc(d.mecanisme)+'</div>';
       }
       $('aeOut').innerHTML=h;
-    }).catch(function(){ b.disabled=false; b.textContent='Lancer l’essai (≈1 min)'; say($('aeMsg'),'Essai injoignable.','err'); });
+    }
+    function sonder(){
+      if(++sondes>80){ repos(); say($('aeMsg'),'Plus de réponse du serveur — relance l’essai.','err'); return; }
+      api('/api/admin/aisessai?etat=1').then(function(r){
+        if(r.code!==200){ setTimeout(sonder,4000); return; }
+        var d=r.body||{};
+        if(d.enCours){
+          say($('aeMsg'),'Variante '+Math.min((d.fait||0)+1,d.total||1)+' sur '+(d.total||'?')+' — résultats affichés au fur et à mesure.','');
+          rendre(d); setTimeout(sonder,3000); return;
+        }
+        repos(); say($('aeMsg'),'','' ); rendre(d);
+      }).catch(function(){ setTimeout(sonder,4000); });
+    }
+    api('/api/admin/aisessai').then(function(r){
+      if(r.code!==200){ repos(); say($('aeMsg'),(r.body&&r.body.error)||('Erreur '+r.code),'err'); return; }
+      var d=r.body||{};
+      if(d.ok===false&&d.raison){ repos(); say($('aeMsg'),d.raison,'err'); return; }
+      say($('aeMsg'),'Essai lancé — '+(d.total||'?')+' variantes de '+(d.dureeS||10)+' s.','');
+      setTimeout(sonder,2500);
+    }).catch(function(){ repos(); say($('aeMsg'),'Lancement injoignable.','err'); });
   };
   document.getElementById('diagBtn').onclick=function(){
   var out=document.getElementById('diagOut'), msg=document.getElementById('diagMsg');
@@ -4794,7 +4810,7 @@ boot();
 </html>
 `;
 const ICONS = { '/icon-180.png': Buffer.from('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', 'base64'), '/icon-192.png': Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAMAAAADACAIAAADdvvtQAAAHIElEQVR42u2dPY5eNRSG7zimSU+TFpRuQBQ0bIOOhbAIFoEQCETDNiKkFFGUNlkBS4hmhiLJMAqZbz7b59/Pqymm+H6ujx+/59j3s+/F4ydPD4Rm1QgBAiAEQAiAEAAhBEAIgBAAIQBCCIAQACEAQgCEEAAhAEKR1AnBh6E0PpaurwlbhxXhz9mMqg40il+0AUwdaIAJgIJxc/qqapHU4QaStgeotcSXnRyjDjpgtCVArdYSaFqMOuiA0TYAtT1uvKTCqIMOGC1dJvTQ9roO1PixQHQratCDFZVzINDJY0Udem510R6d/+Kb6yu3+ERiqG9LzxAu57zdDqlIDPWt0FmE5vwPV4cpTDrrO9Cjys3pb9QlKYAV9cL02HPjQJI3Q70kPRHQ+eQlqWDkylCvRI84N29ePb/9/4vLb+Makh9DvQY9AS3H2pCcGGrQE6FCSjSTDeBAcu3Mi46WFZn7UE9KTwF0tDCyZahBT8GMZpjLGvTAUIYUJtGe2ujIpzOTXNa2G5qzursmtEN7IwG0bD9BopmPIf1E1qFn6LsU70jc83Wr36WcyNrm9Fy0R3f/Ln/5/fTrX7/8+//v2tmH4tZAen1zX98/SM9dhs75wPihiA3QAvh5e0IVo4Am1ALSo2c5J15zpv3cZ0IT32juFS0VQDHqHr1efJAhjQsImMhaNNilYjTUc0P248txtETWqtJz/oun6TnThHxbp81QrEol3YRlgiGpZhZNYbOAe4VVO3mFaqyGCdXZROw1KEdNKGw5HAAgJ/uZzgtS9jPNkPjuWHsTatmdY/rtLskrTvPjATQFdfbwLZqQZxCETChxDbQSdw37cWQovwOZ20+9Xyc6REPChNpusX7Yflr778/QhJKOCgmAbO1Hl560Y8PLhFpGC4msRRNKF9VlgGx/tpHCfpIlsrUebIkGyibbenKFaKNtPZbVz3oi22NbT57zeO1rZ8diyLIfrQmYG1irw7GlPMXGJ1b1Utg6PZc//+YzI3vxzIWhJACNh8YhHN5Jdp0hI+xmLzK6A63/fNPLfqQ4Dm5CxZ/+F4Ge1y+e5ZpwBAVoYiQF+dWmO0OmoTMCqCV4TlSI5JUwbqSwiHpvQqSw6CYc2H5WElnYLNZrDQcxenSjH+yZX+YOpJ/IHeeuqlsTVxKZRUzGe7ZQDRS5dq47q0//mDfkG/kqDpTEfuqZUKnzgVLQs1IMbXM+ENpGJQCKc9N01ITyZ7E211vRlI6e9Vl9kJl85RUdZBD/VqDBSe3nvQk5nZNHDRQ6paoyBEBUP8zCgtATe6P7DibEOhAM7QpQGfshhaF9TSgrQFXtJx1DDXoQKQwTAiDsJydDOBDaCaB9qp8sJhQOoBNPuaZ2PgyfOB4FoGgN3s2EtOM/DpDTjrg97cchkQ32L0U02qCI3rn6CV5NRwToo7RN7XzLUMCCkhSGwgO0Mm6wn5VEZuBYOBDFkD1A+jP5d0PHxX5urq/2Xbsa79m4DuSbvGJi9ObV802LaNaj7RmyiXlQB/rq1z9hpfQsrMoRf7VNyKBP7RzofEfFftYZMqsZwqUw6NkjhSFmZKsAjafMB30V+xFhaCZ/zRa1OBBKlcJODA7sR8SEjJfcLh4/ebpGoNFzC2UOVhq82rtH0H35zXcGGWEdBcv8lSmFyQwsm+UrP3q2mIVNh0aMIT2MhD7cOUSmANkuSYsFSBwjuQ+0hmDtspdroMPuAViSxZBEE5TGj7X9rDWhyyA83gE311dzKEy/8dwgPtgWTdPNRc+R9IFzKgw5JeWMhbMCQCMm9M9Pbz/8+/ZAovr8x8+Mh0qL3kgUO7ByAI3gDEP+9Ahlau6FoTgAYUKb2Y+zA8FQgTBKAzSINgw50CO6TtE2H0B4TzyAxgGHITt6pJdJdRyITT8xpdAvLfd4wn4KpjAS2R7JS9+BYKg6PUfAlWgYyhUcZYCmwIch4bBozmn0HYgZWbmZl3kKoxgqV/rErYFgKFcorACiGKpV+ng4EAyVo8c8hcFQLXo8aiAmZbUi3FK0cEMTCjvtijELg6ES9BwyW5vn6RXGV3G3obTk9xA61QauO1On9kSf0ythSdLae+pXWXpvbZZm6G4/hcJIcduy67wkwN54HYaCGJL6dnfvWW2MwxXUGPIiyeiYhABrImFO53gXi9bM+lUcJtOzNcIspwU73kXZik739xBSnkexRFqMjXc+kCFDgZjISc8R9IApk3SWTyHvAjXiBT3+DvT1H3/Rxen08ofvSzsQyiAAQktyvZk6yXx16FMVfz1rfEtilHDe0HPHugxGaaecvULcU2OUfLWi1xm+6TAqsdBVAqCP+iM4SbUWSPtRTzFJKrqw3o/CGnoGD9AAUAiYNruF148N9ck+nqCK272bAgQNcuJeGAIgBEAIgBAAIQRACIAQACEAQgiAEAAhAEIAhBAAIWn9C9MBrxKmJhT1AAAAAElFTkSuQmCC', 'base64'), '/icon-512.png': Buffer.from('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', 'base64') };
-const BUILD = '17/10b — reproduction de la zone de la panne';
+const BUILD = '17/10c — essai AIS en tache de fond';
 const LEAFLET_JS = `/* @preserve
  * Leaflet 1.9.4, a JS library for interactive maps. https://leafletjs.com
  * (c) 2010-2023 Vladimir Agafonkin, (c) 2010-2011 CloudMade
@@ -5686,7 +5702,17 @@ const server = http.createServer(async (req, res) => {
       if (p === '/api/admin/aisessai' && req.method === 'GET') {
         if (!AIS_KEY) return json(res, 200, { ok: false, raison: 'aucune cle AIS configuree' });
         if (typeof WebSocket !== 'function') return json(res, 200, { ok: false, raison: 'websocket indisponible' });
-        const duree = Math.min(30, Math.max(5, parseInt(u.searchParams.get('duree') || '12', 10) || 12)) * 1000;
+        /* L'essai dure plus d'une minute : le tenir dans une seule requete HTTP
+           echoue depuis un telephone (la liaison est coupee avant la fin). Il
+           est donc lance en tache de fond et la console interroge l'avancement
+           par ?etat=1. */
+        if (u.searchParams.get('etat') === '1') {
+          return json(res, 200, essaiEtat || { enCours: false, jamaisLance: true, essais: [] });
+        }
+        if (essaiEtat && essaiEtat.enCours) {
+          return json(res, 200, { enCours: true, deja: true, fait: essaiEtat.fait, total: essaiEtat.total });
+        }
+        const duree = Math.min(30, Math.max(5, parseInt(u.searchParams.get('duree') || '10', 10) || 10)) * 1000;
         const TYPES = ['PositionReport', 'StandardClassBPositionReport', 'ShipStaticData'];
         const bf = aisBoiteFlotte();
         const boiteProd = bf ? [bf.boite] : [[[-90, -180], [90, 180]]];
@@ -5713,28 +5739,8 @@ const server = http.createServer(async (req, res) => {
         const tl = Math.min(350, Math.max(1, parseFloat(tailleDemandee[1]) || 39));
         const boitePanne = aisBoiteTaille(bf, th, tl);
         if (boitePanne) variantes.push({ nom: 'zone de la panne (' + th + '° x ' + tl + '°), sans filtre', sub: { BoundingBoxes: boitePanne } });
-        const out = { dureeS: duree / 1000, mode: aisMode, zone: bf ? bf.info : 'aucune boite calculable', essais: [] };
-        for (const v of variantes) out.essais.push(await aisEssaiUn(v, duree));
-        const bons = out.essais.filter((e) => e.survit && e.messages > 0);
-        const vivants = out.essais.filter((e) => e.survit);
-        out.ok = bons.length > 0;
-        out.verdict = bons.length
-          ? 'Abonnement a adopter : ' + bons[0].nom + ' (' + bons[0].messages + ' message(s) en ' + bons[0].dureeS + ' s).'
-          : (vivants.length
-              ? 'Les liaisons tiennent mais ne recoivent rien : l abonnement est accepte, la zone ne porte pas de trafic.'
-              : 'Aucune variante ne tient : le refus ne vient pas de la charge utile — service indisponible ou compte limite.');
-        /* Lecture automatique du test discriminant : zone de la panne contre
-           zone actuelle. C'est cette ligne qui designe la cause. */
-        const essaiPanne = out.essais.find((e) => e.nom.indexOf('zone de la panne') === 0);
-        const essaiProd = out.essais[0];
-        if (essaiPanne && essaiProd) {
-          out.mecanisme = (!essaiPanne.survit && essaiProd.survit)
-            ? 'CONFIRME : la zone elargie est coupee alors que la zone actuelle tient — c est bien la surface demandee qui declenche le refus. Plafonner la surface, ou decouper la flotte en plusieurs boites.'
-            : (essaiPanne.survit && essaiProd.survit)
-              ? 'INFIRME : meme la zone de la panne tient aujourd hui — la surface n etait pas la cause. Chercher du cote du service lui-meme (saturation passee) ou d une limitation de compte depuis levee.'
-              : 'INDETERMINE : la zone actuelle ne tient pas non plus, le test ne separe rien. Relancer plus tard.';
-        }
-        return json(res, 200, out);
+        aisEssaiLancer(variantes, duree, { mode: aisMode, zone: bf ? bf.info : 'aucune boite calculable' });
+        return json(res, 200, { enCours: true, demarre: true, total: variantes.length, dureeS: duree / 1000 });
       }
       if (p === '/api/admin/meteotest' && req.method === 'GET') {
         const k = process.env.OWM_API_KEY || '';
@@ -7162,6 +7168,47 @@ function aisResumeSub(sub) {
     + (sub.FilterMessageTypes ? ' · ' + sub.FilterMessageTypes.length + ' type(s) filtre(s)' : ' · tous types')
     + (sub.FiltersShipMMSI ? ' · ' + sub.FiltersShipMMSI.length + ' MMSI' : ' · aucun filtre MMSI');
 }
+/* Etat de l'essai en tache de fond : la console l'interroge par ?etat=1.
+   Un seul essai a la fois ; le precedent reste consultable jusqu'au suivant. */
+let essaiEtat = null;
+async function aisEssaiLancer(variantes, duree, meta) {
+  const etat = { enCours: true, debut: Date.now(), total: variantes.length, fait: 0,
+                 dureeS: duree / 1000, mode: meta.mode, zone: meta.zone,
+                 essais: [], verdict: '', mecanisme: '', ok: false };
+  essaiEtat = etat;
+  for (const v of variantes) {
+    try { etat.essais.push(await aisEssaiUn(v, duree)); }
+    catch (e) {
+      etat.essais.push({ nom: v.nom, abonnement: aisResumeSub(v.sub), messages: 0, octets: 0,
+                         premierMs: 0, dureeS: 0, survit: false, coupee: true,
+                         etat: 'echec interne', fermeture: String((e && e.message) || e).slice(0, 120) });
+    }
+    etat.fait++;
+  }
+  const bons = etat.essais.filter((e) => e.survit && e.messages > 0);
+  const vivants = etat.essais.filter((e) => e.survit);
+  etat.ok = bons.length > 0;
+  etat.verdict = bons.length
+    ? 'Abonnement a adopter : ' + bons[0].nom + ' (' + bons[0].messages + ' message(s) en ' + bons[0].dureeS + ' s).'
+    : (vivants.length
+        ? 'Les liaisons tiennent mais ne recoivent rien : l abonnement est accepte, la zone ne porte pas de trafic.'
+        : (etat.essais.every((e) => !e.ouverte)
+            ? 'Aucune liaison n a pu s ouvrir : le service est injoignable depuis le serveur (reseau, TLS ou compte suspendu).'
+            : 'Aucune variante ne tient : le refus ne vient pas de la charge utile — service indisponible ou compte limite.'));
+  /* Lecture automatique du test discriminant : zone de la panne contre zone
+     actuelle. C'est cette ligne qui designe la cause. */
+  const essaiPanne = etat.essais.find((e) => e.nom.indexOf('zone de la panne') === 0);
+  const essaiProd = etat.essais[0];
+  if (essaiPanne && essaiProd) {
+    etat.mecanisme = (!essaiPanne.survit && essaiProd.survit)
+      ? 'CONFIRME : la zone elargie est coupee alors que la zone actuelle tient — c est bien la surface demandee qui declenche le refus. Plafonner la surface, ou decouper la flotte en plusieurs boites.'
+      : (essaiPanne.survit && essaiProd.survit)
+        ? 'INFIRME : meme la zone de la panne tient aujourd hui — la surface n etait pas la cause. Chercher du cote du service lui-meme (saturation passee) ou d une limitation de compte depuis levee.'
+        : 'INDETERMINE : la zone actuelle ne tient pas non plus, le test ne separe rien. Relancer plus tard.';
+  }
+  etat.enCours = false;
+  etat.finA = Date.now();
+}
 /* Boite de meme centre que celle de la flotte, mais de dimensions imposees :
    sert a rejouer la zone exacte demandee pendant la panne (21 x 39 degres) et
    a departager « surface trop grande » de « cause ailleurs ». */
@@ -7175,16 +7222,20 @@ function aisBoiteTaille(bf, hauteur, largeur) {
 function aisEssaiUn(v, duree) {
   return new Promise((resolve) => {
     const r = { nom: v.nom, abonnement: aisResumeSub(v.sub), messages: 0, octets: 0,
-                premierMs: 0, dureeS: 0, fermeture: '', coupee: false, survit: false, etat: '' };
+                premierMs: 0, dureeS: 0, fermeture: '', coupee: false, ouverte: false,
+                survit: false, etat: '' };
     const t0 = Date.now();
     let ws = null, fini = false, tFin = null, tStop = null;
     const fin = () => {
       if (fini) return; fini = true;
       clearTimeout(tFin); clearTimeout(tStop);
       r.dureeS = Math.round((Date.now() - t0) / 100) / 10;
-      r.survit = !r.coupee;
-      r.etat = r.coupee ? 'coupee par le service'
-             : (r.messages ? 'tient et recoit' : 'tient mais silencieuse');
+      /* une liaison jamais ouverte ne « tient » pas : sans ce controle, un
+         reseau bloque se lirait comme un abonnement accepte */
+      r.survit = !r.coupee && r.ouverte;
+      r.etat = !r.ouverte ? 'liaison jamais etablie'
+             : (r.coupee ? 'coupee par le service'
+                         : (r.messages ? 'tient et recoit' : 'tient mais silencieuse'));
       try { if (ws) { ws.onclose = null; ws.close(); } } catch {}
       resolve(r);
     };
@@ -7193,6 +7244,7 @@ function aisEssaiUn(v, duree) {
     tFin = setTimeout(fin, duree + 5000);          /* filet : liaison muette */
     tStop = setTimeout(fin, duree);                 /* arret volontaire */
     ws.onopen = () => {
+      r.ouverte = true;
       try { ws.send(JSON.stringify(Object.assign({ APIKey: AIS_KEY }, v.sub))); }
       catch { r.fermeture = 'envoi de l\'abonnement impossible'; }
     };
