@@ -684,17 +684,25 @@ const S3 = {
   bucket: process.env.S3_BUCKET || '',
   cle: process.env.S3_ACCESS_KEY_ID || '',
   secret: process.env.S3_SECRET_ACCESS_KEY || '',
-  region: process.env.S3_REGION || 'auto'
+  region: process.env.S3_REGION || 'auto',
+  /* « chemin » = https://hote/bucket/cle (Cloudflare R2, Scaleway, IDrive e2) ;
+     « virtuel » = https://bucket.hote/cle. Les hebergeurs n'acceptent pas tous
+     les deux : l'essai d'archive de la console designe celui qui fonctionne. */
+  style: (process.env.S3_STYLE || 'chemin').toLowerCase()
 };
 const ARCHIVE_ACTIVE = !!(S3.endpoint && S3.bucket && S3.cle && S3.secret);
-let archiveInfo = ARCHIVE_ACTIVE ? 'configuree (' + S3.bucket + ')' : 'inactive (variables S3 absentes)';
+let archiveInfo = ARCHIVE_ACTIVE ? 'configuree (' + S3.bucket + ', style ' + S3.style + ')' : 'inactive (variables S3 absentes)';
 let archiveDernier = '';
 
 /* --- signature AWS Signature V4, sans dependance --- */
 function s3Hash(x) { return crypto.createHash('sha256').update(x).digest('hex'); }
 function s3Hmac(cle, x) { return crypto.createHmac('sha256', cle).update(x).digest(); }
-async function s3Requete(methode, chemin, corps, typeContenu) {
-  const url = new URL(S3.endpoint.replace(/\/$/, '') + '/' + S3.bucket + chemin);
+async function s3Requete(methode, chemin, corps, typeContenu, styleForce) {
+  const style = styleForce || S3.style;
+  const base = S3.endpoint.replace(/\/$/, '');
+  const url = style === 'virtuel'
+    ? new URL(base.replace('://', '://' + S3.bucket + '.') + chemin)
+    : new URL(base + '/' + S3.bucket + chemin);
   const maintenant = new Date();
   const amzDate = maintenant.toISOString().replace(/[:-]|\.\d{3}/g, '');
   const dateJour = amzDate.slice(0, 8);
@@ -4321,6 +4329,14 @@ const PAGE_ADMIN = `<!DOCTYPE html>
   </div>
 
   <div class="card">
+    <div class="lbl">Essai de l'archive S3</div>
+    <p class="sub" style="margin:0 0 8px">Écrit, relit puis efface un objet de contrôle. Valide d'un coup les clés, le bucket, la région et le style d'adressage.</p>
+    <button id="arBtn">Tester l'archive</button>
+    <div id="arOut" style="margin-top:10px;font-size:12.5px;line-height:1.6"></div>
+    <p class="msg" id="arMsg"></p>
+  </div>
+
+  <div class="card">
     <div class="lbl">Diagnostic du serveur</div>
     <button id="diagBtn">Lancer le diagnostic</button>
     <div id="diagOut" style="display:none;margin-top:10px;font-size:12.5px;line-height:1.55"></div>
@@ -4743,6 +4759,31 @@ var triCache=[];
       setTimeout(sonder,2500);
     }).catch(function(){ repos(); say($('aeMsg'),'Lancement injoignable.','err'); });
   };
+  /* Essai de l'archive S3 — bloc isole : son absence ne doit rien casser */
+  if($('arBtn')) $('arBtn').onclick=function(){
+    var b=this; b.disabled=true; b.textContent='Essai en cours…'; $('arOut').innerHTML='';
+    say($('arMsg'),'','');
+    api('/api/admin/archivetest').then(function(r){
+      b.disabled=false; b.textContent='Tester l’archive';
+      if(r.code!==200){ say($('arMsg'),(r.body&&r.body.error)||('Erreur '+r.code),'err'); return; }
+      var d=r.body||{};
+      if(d.ok===false&&d.raison){ say($('arMsg'),d.raison,'err'); return; }
+      var h='<div style="color:#8fb0c4;margin-bottom:6px">'+esc(d.bucket||'')+' · région '+esc(d.region||'')+' · style configuré : '+esc(d.styleConfigure||'')+'</div>';
+      (d.essais||[]).forEach(function(bl){
+        h+='<div style="margin:8px 0;padding:8px;border-radius:8px;background:rgba(255,255,255,.05)">'
+          +'<div style="font-weight:700;color:'+(bl.ok?'#2dd4bf':'#fbbf24')+'">'+(bl.ok?'✓ ':'✗ ')+'style '+esc(bl.style)+'</div>';
+        (bl.etapes||[]).forEach(function(e){
+          var bon=e.code>=200&&e.code<300;
+          h+='<div style="color:'+(bon?'#2dd4bf':'#fbbf24')+'">'+(bon?'✓':'✗')+' '+esc(e.op)+' — '
+            +(e.code?esc(String(e.code)):'pas de réponse')
+            +(e.detail?(' · '+esc(String(e.detail))):'')+'</div>';
+        });
+        h+='</div>';
+      });
+      if(d.verdict) h+='<div style="margin-top:10px;font-weight:700">'+esc(d.verdict)+'</div>';
+      $('arOut').innerHTML=h;
+    }).catch(function(){ b.disabled=false; b.textContent='Tester l’archive'; say($('arMsg'),'Essai injoignable.','err'); });
+  };
   document.getElementById('diagBtn').onclick=function(){
   var out=document.getElementById('diagOut'), msg=document.getElementById('diagMsg');
   say(msg,'Diagnostic en cours…','');
@@ -4810,7 +4851,7 @@ boot();
 </html>
 `;
 const ICONS = { '/icon-180.png': Buffer.from('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', 'base64'), '/icon-192.png': Buffer.from('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', 'base64'), '/icon-512.png': Buffer.from('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', 'base64') };
-const BUILD = '17/10d — garde-fou anti-blocage aisstream';
+const BUILD = '18/10b — arret propre + decoupage multi-boites';
 const LEAFLET_JS = `/* @preserve
  * Leaflet 1.9.4, a JS library for interactive maps. https://leafletjs.com
  * (c) 2010-2023 Vladimir Agafonkin, (c) 2010-2011 CloudMade
@@ -5578,6 +5619,11 @@ const server = http.createServer(async (req, res) => {
                   + (vapiPollMs ? Math.round(vapiPollMs / 60000) + ' min entre interrogations, ~' + parJour + ' requete(s)/jour' : 'inactif');
               })()) : 'cle absente'),
           'aisstream : ' + (AIS_KEY ? (aisWs && aisOuvertA ? 'connecte' : aisWs ? 'tentative en cours' : 'deconnecte') + ' — ' + aisLastEvent + (aisDerniereErreur ? ' — derniere erreur serveur : ' + aisDerniereErreur : '') + (aisProchain > Date.now() ? ' (attente ' + Math.round((aisProchain - Date.now()) / 60000) + ' min)' : '') : 'non configure'),
+          'Decoupage multi-boites : '
+            + (AIS_BOITES ? (aisDecoupage ? 'ACTIF' : 'active mais non retenu (pas plus econome)') : 'inactif (variable AIS_BOITES absente)')
+            + ' — ' + aisComparaisonBoites(),
+          'Rendement du flux : ' + aisPosOk + ' position(s) retenue(s) pour ' + aisHorsFlotte + ' message(s) tiers ignore(s)'
+            + ((aisPosOk + aisHorsFlotte) ? ' — ' + (Math.round(10000 * aisPosOk / (aisPosOk + aisHorsFlotte)) / 100) + ' % utile' : ''),
           'Refus de poignee de main consecutifs : ' + aisRefusSuite
             + (aisRefusSuite >= AIS_REFUS_MAX
                 ? ' — compte vraisemblablement limite par aisstream : ne lancer AUCUN essai, laisser le serveur attendre'
@@ -5752,6 +5798,13 @@ const server = http.createServer(async (req, res) => {
           if (mmsi50.length) variantes.push({ nom: 'meme zone + filtre MMSI', sub: { BoundingBoxes: boiteProd, FiltersShipMMSI: mmsi50 } });
         }
         if (boiteSerree) variantes.push({ nom: 'zone reduite de moitie, sans filtre', sub: { BoundingBoxes: boiteSerree } });
+        /* La variante qui mesure le gain du decoupage : memes bateaux couverts,
+           surface bien moindre. Comparer son nombre de messages a celui de la
+           charge de production donne l'economie reelle, pas une estimation. */
+        const dec = aisBoitesFlotte(AIS_BOITES_MAX);
+        if (dec && dec.nombre > 1) {
+          variantes.push({ nom: 'decoupage multi-boites (' + dec.nombre + ' boites, ' + dec.surface + ' deg2)', sub: { BoundingBoxes: dec.boites } });
+        }
         /* Reproduction de la panne : la zone reellement demandee du 02/09 au
            17/10 etait de 21 x 39 degres. On la rejoue, recentree sur la flotte.
            Reglable par &taille=HxL pour poser d'autres questions sans
@@ -5763,6 +5816,48 @@ const server = http.createServer(async (req, res) => {
         if (boitePanne) variantes.push({ nom: 'zone de la panne (' + th + '° x ' + tl + '°), sans filtre', sub: { BoundingBoxes: boitePanne } });
         aisEssaiLancer(variantes, duree, { mode: aisMode, zone: bf ? bf.info : 'aucune boite calculable' });
         return json(res, 200, { enCours: true, demarre: true, total: variantes.length, dureeS: duree / 1000 });
+      }
+      /* Essai de l'archive longue duree : ecrit, relit et efface un objet de
+         controle. Essaie le style « chemin » puis « virtuel » — c'est le seul
+         moyen sur de savoir ce que l'hebergeur accepte, plutot que de le
+         supposer d'apres son nom. */
+      if (p === '/api/admin/archivetest' && req.method === 'GET') {
+        if (!ARCHIVE_ACTIVE) {
+          return json(res, 200, { ok: false, raison: 'Variables S3 absentes. Il en faut cinq sur le serveur : S3_ENDPOINT, S3_BUCKET, S3_ACCESS_KEY_ID, S3_SECRET_ACCESS_KEY, S3_REGION.' });
+        }
+        const out = { endpoint: S3.endpoint, bucket: S3.bucket, region: S3.region, styleConfigure: S3.style, essais: [] };
+        const cheminEssai = '/_controle/essai-' + Date.now() + '.txt';
+        const contenu = Buffer.from('essai sea-tracker ' + new Date().toISOString() + '\n');
+        const demande = u.searchParams.get('style');
+        const styles = demande ? [demande] : ['chemin', 'virtuel'];
+        for (const st of styles) {
+          const bloc = { style: st, etapes: [], ok: false };
+          try {
+            const r1 = await s3Requete('PUT', cheminEssai, contenu, 'text/plain', st);
+            bloc.etapes.push({ op: 'ecriture', code: r1.status, detail: r1.ok ? '' : (await r1.text()).slice(0, 260) });
+            if (r1.ok) {
+              const r2 = await s3Requete('GET', cheminEssai, null, null, st);
+              const lu = r2.ok ? Buffer.from(await r2.arrayBuffer()) : null;
+              bloc.etapes.push({ op: 'relecture', code: r2.status,
+                detail: r2.ok ? (lu.length + ' octets, contenu ' + (lu.equals(contenu) ? 'identique' : 'DIFFERENT')) : (await r2.text()).slice(0, 260) });
+              const r3 = await s3Requete('DELETE', cheminEssai, null, null, st);
+              bloc.etapes.push({ op: 'effacement', code: r3.status, detail: (r3.ok || r3.status === 204) ? '' : (await r3.text()).slice(0, 260) });
+              bloc.ok = !!(r2.ok && lu && lu.equals(contenu));
+            }
+          } catch (e) {
+            bloc.etapes.push({ op: 'liaison', code: 0, detail: String((e && (e.cause && e.cause.code || e.message)) || e).slice(0, 200) });
+          }
+          out.essais.push(bloc);
+          if (bloc.ok) break;
+        }
+        const gagnant = out.essais.find((b) => b.ok);
+        out.ok = !!gagnant;
+        out.verdict = gagnant
+          ? (gagnant.style === S3.style
+              ? 'Archive operationnelle : ecriture, relecture et effacement reussis.'
+              : 'Archive operationnelle en style « ' + gagnant.style + ' » : ajouter la variable S3_STYLE=' + gagnant.style + ' sur le serveur, puis relancer cet essai.')
+          : 'Archive inutilisable. Lire les codes : 403 = cles ou droits insuffisants, 404 = bucket ou region faux, 0 = hote injoignable, 400 = signature ou region refusee.';
+        return json(res, 200, out);
       }
       if (p === '/api/admin/meteotest' && req.method === 'GET') {
         const k = process.env.OWM_API_KEY || '';
@@ -7201,8 +7296,12 @@ function aisReconnect() {
    imparti. Permet de departager « charge utile refusee » de « volume trop
    important » sans jamais toucher a la connexion de production. ---- */
 function aisResumeSub(sub) {
-  const b = (sub.BoundingBoxes || [])[0];
-  const z = b ? (Math.round(b[1][0] - b[0][0]) + '° x ' + Math.round(b[1][1] - b[0][1]) + '°') : 'aucune zone';
+  const bs = sub.BoundingBoxes || [];
+  const b = bs[0];
+  const z = !b ? 'aucune zone'
+    : bs.length > 1
+      ? (bs.length + ' boites, ' + Math.round(bs.reduce((s, x) => s + (x[1][0] - x[0][0]) * (x[1][1] - x[0][1]), 0)) + ' deg2')
+      : (Math.round(b[1][0] - b[0][0]) + '° x ' + Math.round(b[1][1] - b[0][1]) + '°');
   return 'zone ' + z
     + (sub.FilterMessageTypes ? ' · ' + sub.FilterMessageTypes.length + ' type(s) filtre(s)' : ' · tous types')
     + (sub.FiltersShipMMSI ? ' · ' + sub.FiltersShipMMSI.length + ' MMSI' : ' · aucun filtre MMSI');
@@ -7305,6 +7404,7 @@ function aisEssaiUn(v, duree) {
   });
 }
 let aisMode = 'mmsi', aisZoneInfo = '', aisHorsFlotte = 0, aisZoneEchec = '';
+let aisDecoupage = false; /* l'abonnement en cours utilise-t-il plusieurs boites ? */
 /* MMSI de la flotte effectivement vus depuis le demarrage : distingue « la zone
    ne les couvre pas » de « ils n'emettent pas » */
 const aisVus = new Set();
@@ -7373,8 +7473,89 @@ function aisBoiteFlotte() {
   const hauteur = la1 - la0, largeur = lo1 - lo0;
   if (hauteur > 40 || largeur > 60) return null;
   return { boite: [[la0, lo0], [la1, lo1]],
+           surface: Math.round(hauteur * largeur),
            info: Math.round(hauteur) + '\u00b0 x ' + Math.round(largeur) + '\u00b0, ' + couverts + '/' + total
                  + ' positions connues, marge ' + marge.toFixed(1) + '\u00b0' };
+}
+/* --- Decoupage de la flotte en plusieurs boites compactes ---------------
+   Une boite unique englobe toute la mer comprise entre les deux bateaux les
+   plus eloignes : on recoit, et on jette, tout le trafic de cette region
+   (mesure du 18/10 : 653 194 messages tiers pour 644 positions retenues).
+   Plusieurs petites boites couvrent les memes bateaux pour une fraction de la
+   surface. aisstream accepte plusieurs boites dans un meme abonnement.
+   Methode : agglomeration ascendante \u2014 une boite par position, puis fusion
+   des deux boites dont le regroupement coute le moins de surface, jusqu'a
+   nmax boites ; marge appliquee ensuite, et fusion des boites qui se
+   chevauchent pour ne pas s'abonner deux fois a la meme eau. */
+const AIS_BOITES = process.env.AIS_BOITES === '1';
+const AIS_BOITES_MAX = Math.max(2, Math.min(12, parseInt(process.env.AIS_BOITES_MAX || '6', 10) || 6));
+function aisBoitesFlotte(nmax) {
+  const pos = [];
+  for (const mmsi of aisInfo.keys()) {
+    let p = aisLast.get(mmsi);
+    if (!p || !isFinite(p[0]) || !isFinite(p[1])) p = aisDerniereConnue.get(mmsi);
+    if (p && isFinite(p[0]) && isFinite(p[1])) pos.push([p[0], p[1]]);
+  }
+  if (pos.length < 3) return null;
+  const couverts = pos.length, total = aisInfo.size;
+  /* meme regle de marge que la boite unique : rien de valide n'est modifie */
+  const marge = (couverts >= total) ? 2 : Math.min(8, 2 + 6 * (1 - couverts / Math.max(1, total)));
+  const surf = (b) => Math.max(0.01, b.la1 - b.la0) * Math.max(0.01, b.lo1 - b.lo0);
+  const fus = (a, b) => ({ la0: Math.min(a.la0, b.la0), la1: Math.max(a.la1, b.la1),
+                           lo0: Math.min(a.lo0, b.lo0), lo1: Math.max(a.lo1, b.lo1), n: a.n + b.n });
+  let grp = pos.map((p) => ({ la0: p[0], la1: p[0], lo0: p[1], lo1: p[1], n: 1 }));
+  while (grp.length > nmax) {
+    let mi = 0, mj = 1, cout = Infinity;
+    for (let i = 0; i < grp.length; i++) {
+      for (let j = i + 1; j < grp.length; j++) {
+        const c = surf(fus(grp[i], grp[j])) - surf(grp[i]) - surf(grp[j]);
+        if (c < cout) { cout = c; mi = i; mj = j; }
+      }
+    }
+    const f = fus(grp[mi], grp[mj]);
+    grp = grp.filter((_, k) => k !== mi && k !== mj);
+    grp.push(f);
+  }
+  let boites = grp.map((b) => ({
+    la0: Math.max(-90, b.la0 - marge), la1: Math.min(90, b.la1 + marge),
+    lo0: Math.max(-180, b.lo0 - marge), lo1: Math.min(180, b.lo1 + marge), n: b.n
+  }));
+  let encore = true;
+  while (encore) {
+    encore = false;
+    paires:
+    for (let i = 0; i < boites.length; i++) {
+      for (let j = i + 1; j < boites.length; j++) {
+        const a = boites[i], b = boites[j];
+        if (a.la0 <= b.la1 && b.la0 <= a.la1 && a.lo0 <= b.lo1 && b.lo0 <= a.lo1) {
+          boites[i] = fus(a, b);
+          boites.splice(j, 1);
+          encore = true;
+          break paires;
+        }
+      }
+    }
+  }
+  const surface = boites.reduce((s, b) => s + (b.la1 - b.la0) * (b.lo1 - b.lo0), 0);
+  return {
+    boites: boites.map((b) => [[b.la0, b.lo0], [b.la1, b.lo1]]),
+    nombre: boites.length,
+    surface: Math.round(surface),
+    couverts: couverts, total: total, marge: marge,
+    info: boites.length + ' boite(s), ' + Math.round(surface) + ' deg2, '
+          + couverts + '/' + total + ' positions connues, marge ' + marge.toFixed(1) + '\u00b0'
+  };
+}
+/* Comparaison lisible pour le diagnostic : ce que le decoupage donnerait,
+   meme quand il n'est pas actif. Permet de mesurer le gain avant de basculer. */
+function aisComparaisonBoites() {
+  const m = aisBoitesFlotte(AIS_BOITES_MAX);
+  if (!m) return 'impossible (moins de 3 positions connues)';
+  const u1 = aisBoiteFlotte();
+  if (!u1 || !u1.surface) return m.info;
+  const gain = Math.round(100 - 100 * m.surface / u1.surface);
+  return m.info + ' \u2014 contre ' + u1.surface + ' deg2 en boite unique, soit '
+       + (gain > 0 ? gain + ' % de surface en moins' : 'aucun gain');
 }
 function aisConnect(force) {
   if (!AIS_KEY || typeof WebSocket !== 'function') return;
@@ -7394,11 +7575,24 @@ function aisConnect(force) {
   let boites = [[[-90, -180], [90, 180]]], filtre = list;
   aisMode = 'mmsi';
   aisZoneEchec = '';
+  aisDecoupage = false;
   /* la case « bateaux tiers » impose le mode zone : en filtre MMSI, aisstream
      ne livre que nos bateaux et la case resterait sans effet */
   if (tousMmsi.length > AIS_PLAFOND || aisTiersActif) {
     const b = aisBoiteFlotte();
-    if (b) { boites = [b.boite]; filtre = null; aisMode = 'zone'; aisZoneInfo = b.info; }
+    if (b) {
+      boites = [b.boite]; filtre = null; aisMode = 'zone'; aisZoneInfo = b.info;
+      /* Decoupage : seulement s'il est active ET strictement plus econome que
+         la boite unique. Au moindre doute on garde le comportement valide. */
+      if (AIS_BOITES) {
+        try {
+          const m = aisBoitesFlotte(AIS_BOITES_MAX);
+          if (m && m.nombre > 1 && m.surface < b.surface) {
+            boites = m.boites; aisZoneInfo = m.info; aisDecoupage = true;
+          }
+        } catch (e) { aisZoneEchec = 'decoupage impossible : ' + ((e && e.message) || e); }
+      }
+    }
     else aisZoneEchec = 'flotte trop dispersee ou moins de 3 positions connues';
   }
   /* Garde-fou : ne jamais envoyer plus de MMSI que le plafond du service.
@@ -7660,3 +7854,24 @@ if (ARCHIVE_ACTIVE) {
   setInterval(() => { archiveBasculer(false).catch(() => {}); }, 3600e3);
 }
 server.listen(PORT, () => { console.log('Sea Tracker (' + (USE_REDIS ? 'Upstash Redis' : 'fichiers') + ') sur http://localhost:' + PORT); if (AIS_KEY || VAPI_KEY) aisRefresh(!!AIS_KEY); });
+
+/* --- Arret propre -------------------------------------------------------
+   Render envoie SIGTERM avant chaque redeploiement. Sans ce traitement, le
+   processus est tue sans fermer la liaison aisstream : elle reste ouverte
+   cote service jusqu'au delai TCP. Or le compte est plafonne a trois
+   connexions simultanees — deux ou trois redeploiements rapproches suffisent
+   alors a saturer les places, et toute nouvelle poignee de main est refusee
+   (code 1006 immediat), ce qui ressemble a s'y meprendre a un blocage.
+   Fermer explicitement rend la place aussitot. */
+let arretEnCours = false;
+function arretPropre(signal) {
+  if (arretEnCours) return;
+  arretEnCours = true;
+  console.log('Arret (' + signal + ') : fermeture de la liaison AIS');
+  try { if (aisTimer) { clearTimeout(aisTimer); aisTimer = null; } } catch {}
+  try { if (aisWs) { aisWs.onclose = null; aisWs.onerror = null; aisWs.close(1001, 'arret du serveur'); aisWs = null; } } catch {}
+  try { server.close(); } catch {}
+  setTimeout(() => process.exit(0), 700);
+}
+process.on('SIGTERM', () => arretPropre('SIGTERM'));
+process.on('SIGINT', () => arretPropre('SIGINT'));
